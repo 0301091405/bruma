@@ -11,234 +11,96 @@
 
 ![Selecting a region, drawing on it, then going back one second for a tooltip that has closed](docs/demo.gif)
 
-Press the hotkey and the screen freezes. Drag a region or click a window and
-it's on your clipboard. To draw on it first, click the preview card that
-appears, or hold Shift as you let go of the mouse.
+Press `PrintScreen`, pick an area and it's on your clipboard. If the tooltip
+or menu you wanted closed too early, scroll back: Bruma keeps the last few
+seconds of the screen.
 
-If what you wanted was a tooltip or a menu that closed before you reached the
-hotkey, turn the mouse wheel. Bruma keeps the last four seconds of the screen
-in memory and lets you step back through them.
-
-It's a single executable of about 2 MB, written in Rust. It makes no network
-connections. Windows 10 and 11 only for now.
+One executable of about 2 MB. No network access. Windows 10 and 11.
 
 ## Install
 
 Download [bruma-setup.exe](https://github.com/0301091405/bruma/releases/latest/download/bruma-setup.exe)
-and run it. Setup takes a few seconds, doesn't ask for administrator rights
-and starts Bruma when it's done. From then on Bruma sits in the tray and waits
-for `PrintScreen`.
+and run it. It doesn't need administrator rights. Bruma then waits in the tray.
 
-It needs 64-bit Windows 10 (version 1809 or later) or Windows 11, and nothing
-else.
-
-The files aren't signed, so your browser and SmartScreen may warn about them.
-In the SmartScreen window choose "More info", then "Run anyway".
-
-Or paste this into PowerShell. It downloads the same setup program, checks it
-and runs it without any questions:
+Or paste this into PowerShell:
 
 ```
 irm https://raw.githubusercontent.com/0301091405/bruma/main/install.ps1 | iex
 ```
 
-If you'd rather not install anything, [bruma.exe](https://github.com/0301091405/bruma/releases/latest/download/bruma.exe)
-is the whole program in one file. Put it anywhere and run it.
+[bruma.exe](https://github.com/0301091405/bruma/releases/latest/download/bruma.exe)
+is the same program without setup. Put it anywhere and run it.
 
-To remove Bruma, use "Installed apps" in Windows Settings. Your settings and
-capture history are left where they are.
+The files aren't signed, so SmartScreen may warn you. Choose "More info", then
+"Run anyway". To remove Bruma, use "Installed apps" in Windows Settings.
 
-Or build it yourself (Rust 1.85 or newer):
+## How it works
 
-```
-cargo install --git https://github.com/0301091405/bruma bruma
-```
-
-## What it does
-
-### Rewind
-
-Open the overlay and scroll the wheel (or press `PgUp`) to go back through the
-last few seconds. From there:
-
-- `W` selects whatever changed: the popup that just appeared, or the one that
-  just went away.
-- `K` turns the last seconds into a GIF, at thirty pictures a second. It plays
-  in place before it's saved: drag the ends of the bar under it to trim it,
-  and anything you draw (text, arrows, blur) goes on every frame. `Enter`
-  copies it, and it pastes into chats and folders as a file. Press `K` before
-  you choose the area to go straight to the GIF.
-- `J` puts two moments side by side with the difference outlined, which is
-  usually what a bug report needs.
-
-![The overlay one second in the past, with a closed tooltip selected](docs/rewind.png)
-
-![A GIF in the making: it plays in the selection, with a label drawn on it and a bar to trim it](docs/gif.png)
-
-### Snap
-
-Point at a button, a box or a picture and it gets an outline; click to select
-it. Inside a window the larger parts count too, such as the page of a browser
-or the body of a site: `Tab` steps out from the box under the cursor to the
-part around it and then to the whole window, `Shift+Tab` steps back. If you
-drag instead, the edges settle on the nearest real edge. This works from the
-pixels and the window layout, so it doesn't matter what kind of program is
-underneath.
-`G` turns it off, holding `Alt` suspends it.
+- **Copy.** Drag over an area, or click a box, a picture or a window. It's
+  copied at once. Click the card that appears to draw on it, or hold `Shift`
+  as you let go.
+- **Snap.** Whatever is under the cursor gets an outline. `Tab` steps out to
+  the larger area around it, like the page of a browser, then the window.
+- **Rewind.** Turn the mouse wheel to go back through the last few seconds.
+  `W` selects what changed.
+- **GIF.** `K` turns the last ten seconds into a GIF at 30 frames a second.
+  Trim it, draw on it, and `Enter` copies it as a file.
+- **Draw.** Arrows, boxes, text, numbered steps, blur and more, right on the
+  screen. There is no separate editor.
+- **Private text.** `M` blurs e-mail addresses, card numbers, passwords and
+  the like. `X` copies the text. It uses the text recognition built into
+  Windows and can miss things, so check before you send.
 
 ![Pointing at a button outlines the button](docs/snap.png)
 
-### Drawing
-
-Arrow, line, rectangle, ellipse, pen, highlighter, text, numbered steps, blur
-and a ruler, all in the same overlay. There is no separate editor window.
-Every tool is one key and `F1` lists them.
+![A GIF being made: it plays in the selection, with a label on it and a bar to trim it](docs/gif.png)
 
 ![A selection with an arrow, a highlight, a blur and a label](docs/overlay.png)
-
-### Focus
-
-The opposite of blurring something out: mark the part that matters with `O`
-and the rest of the capture goes soft.
-
-![A capture where one area is sharp and the rest is out of focus](docs/focus.png)
-
-### Private text
-
-`M` reads the selection and blurs what looks private: e-mail addresses, phone
-and card numbers, IBANs, IP addresses, API keys, whatever follows `Password:`.
-`X` copies the text instead. Both use the text recognition that ships with
-Windows, so nothing leaves the machine.
-
-These are heuristics and the recognition does miss things. Check the result
-before you send it.
-
-### Smaller things
-
-- Scrolling capture (`Y`) scrolls the page for you and joins the pieces.
-- A saved PNG keeps its drawings inside the file. `bruma edit shot.png` opens
-  it again with every arrow still movable.
-- History keeps the last 200 captures and can be searched by the text in them.
-- `U` puts the capture in a frame with rounded corners and a shadow.
-- `C` copies the colour under the cursor. `P` pins the capture on screen.
-- `run_after` runs a command on every saved file, for uploading or anything
-  else. If the command prints a URL, the URL is copied.
 
 ## Keys
 
 | Key | |
 |---|---|
-| drag | copy a region |
-| click | copy the box, picture or window under the cursor |
-| `Tab`, `Shift+Tab` | a larger or smaller area around the cursor |
-| `Shift` while letting go | keep it open to draw on |
-| `F`, `Z` | whole monitor, the region used last time |
-| `S` | shrink the selection to its content |
+| drag, click | copy an area, or the box or window under the cursor |
+| `Tab`, `Shift+Tab` | a larger or smaller area |
+| `F`, `Z` | whole monitor, the last area again |
 | wheel, `PgUp` `PgDn` | rewind |
-| `W` `J` `K` | select what changed, before/after picture, GIF |
-| `Space` | play or pause a GIF |
-| `V` `A` `L` `R` `E` | select, arrow, line, rectangle, ellipse |
+| `W` `K` `J` | what changed, GIF, before/after |
+| `A` `L` `R` `E` | arrow, line, rectangle, ellipse |
 | `D` `H` `T` `N` | pen, highlighter, text, numbered step |
-| `B` `O` `Q` | blur, focus, ruler |
-| `1` to `6`, `[` `]` | colour, stroke width |
+| `B` `O` | blur, focus |
 | `M` `X` | blur private text, copy text |
-| `Ctrl+Z` `Ctrl+Y` `Del` | undo, redo, delete |
-| `Enter` or `Ctrl+C` | copy and close |
-| `Ctrl+S` | save and close |
-| `Esc` | one step back, then close |
+| `Ctrl+Z` `Ctrl+Y` | undo, redo |
+| `Enter`, `Ctrl+S` | copy, save |
+| `Esc` | back, then close |
 
-`F1` in the overlay shows the full list.
-
-## Command line
-
-```
-bruma                               run in the background (tray and hotkey)
-bruma capture                       open the overlay now
-bruma capture --delay 3             open it in 3 seconds
-bruma capture --full -o shot.png    save the whole screen without the overlay
-bruma capture --region 0,0,800,600 -o shot.png
-bruma edit shot.png                 reopen a saved capture
-bruma find invoice                  list past captures containing a word
-bruma mask shot.png                 blur private text in an existing PNG
-bruma ocr shot.png                  print the text in a PNG
-bruma lab                           open a page for trying every feature
-bruma probe                         time screen reads on this machine
-bruma settings                      show the settings of the running Bruma
-```
-
-If another program already owns `PrintScreen`, Bruma falls back to
-`Ctrl+PrintScreen`, then `Ctrl+Alt+B`, and says so in its tray menu.
-
-A left click on the tray icon takes a capture; a right click opens the menu.
+`F1` in Bruma lists every key. `bruma --help` lists the command line.
 
 ## Settings
 
-Right-click the tray icon and choose Settings. Changes apply as soon as you
-make them.
+Right-click the tray icon and choose Settings. Changes apply at once and are
+kept in `%APPDATA%\bruma\config.toml`.
 
-![The settings panel over the misted screen](docs/settings.png)
+![The settings panel](docs/settings.png)
 
-Everything is kept in `%APPDATA%\bruma\config.toml`. A few things are only in
-that file; "Edit the settings file" at the bottom of the panel opens it.
+## Privacy
 
-```toml
-hotkey    = "PrintScreen"               # or "ctrl+shift+KeyS"
-save_dir  = "~/Pictures/bruma"
-filename  = "bruma-%Y%m%d-%H%M%S.png"
-color     = 1                           # default colour, 1-6
-stroke    = 3                           # default stroke width
-snap      = true
-autosave  = false                       # also save a file on every copy
-preview   = 4                           # seconds the preview card stays
-rewind    = 4                           # seconds of screen history, 0 = off
-clip      = 10                          # seconds kept for GIFs, 0 = off
-quick     = true                        # copy as soon as an area is chosen
-rewind_fullscreen = false               # record while a game or film is full screen
-fast_capture = true                     # false = always read the screen with GDI
-cursor    = false                       # include the mouse cursor
-history   = 200                         # captures kept, 0 = off
-run_after = ""                          # 'curl -s -F "file=@{file}" https://example.com/upload'
-```
+No network code, no telemetry, no update check. Captures go to your clipboard,
+your disk and a local history folder, nowhere else.
 
-## Speed and cost
-
-On a 1080p monitor the frozen screen is up 25 to 30 ms after the hotkey. A
-frame while you drag or draw takes 2 to 4 ms.
-
-Rewind is the only part that works while you aren't using it. For GIFs it
-looks at the screen thirty times a second at low priority, but it only reads
-and keeps the parts that changed. That takes about 1% of one core while
-something keeps moving and close to nothing when nothing does. It stops while a
-game or a film is full screen. Memory is a few MB while the screen is still;
-when it changes all the time the stills take up to about 100 MB and the GIF
-recording is capped at 320 MB. `clip = 0` stops the GIF recording, `rewind = 0`
-turns rewinding off.
-
-## What it doesn't do
-
-- No video recording. `K` gives you up to the last ten seconds as a GIF and
-  that's all.
-- No built-in upload services. Use `run_after`.
-- No Linux or macOS yet. The core doesn't depend on Windows, the app does.
-- It has mostly been tested on one 1080p monitor. Multiple monitors and
-  display scaling should work but have seen little testing; reports are welcome.
+While Bruma runs it keeps a short recording of the screen in memory for rewind
+and GIFs. It reads only what changes, uses about 1% of one core when the screen
+is busy, and pauses during full-screen games and films. Setting `rewind = 0`
+and `clip = 0` in the settings file turns it off.
 
 ## Building
 
 ```
 cargo build --release
-cargo test
 ```
 
-Needs Rust 1.85 or newer. The code is two crates: `bruma-core` is the logic
-and the drawing, with no window and no OS calls, and `bruma` is the Windows
-application around it.
-
-## Privacy
-
-No network code, no telemetry, no update check. Captures go to your clipboard,
-your disk and the local history folder (`%LOCALAPPDATA%\Bruma\history`), and
-nowhere else unless you set `run_after` to send them somewhere.
+Rust 1.85 or newer. `bruma-core` holds the logic and drawing, `bruma` is the
+Windows app.
 
 ## License
 

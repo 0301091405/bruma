@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-const PAGE: &str = include_str!("../../../lab/index.html");
+const PAGE: &str = include_str!("../assets/lab.html");
 
 /// Writes the lab page to the temp folder and opens it in the default browser.
 pub fn open() -> Result<PathBuf, String> {
