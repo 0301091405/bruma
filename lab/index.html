@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bruma Lab</title>
+<style>
+  :root {
+    --ink: #0e0e0e; --panel: #171717; --line: #2a2a28; --paper: #f2f0eb;
+    --faint: #9a988f; --accent: #ff4f1f; --ok: #2fbf71;
+    --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+    --sans: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--ink); color: var(--paper); font: 15px/1.55 var(--sans); }
+  button, input { font: inherit; color: inherit; }
+  code { font: 13px var(--mono); color: var(--paper); }
+  kbd { font: 12px var(--mono); padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; background: #1e1e1d; white-space: nowrap; }
+  .wrap { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 40px; max-width: 1180px; margin: 0 auto; padding: 36px 28px 96px; }
+  aside { position: sticky; top: 28px; align-self: start; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .mark { width: 30px; height: 30px; flex: none; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: 0.2px; }
+  .sub { color: var(--faint); font-size: 13px; margin: 0 0 22px; }
+  .hotkey { font-size: 13px; color: var(--faint); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 18px; }
+  .bar { height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; margin: 8px 0 14px; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+  .count { font: 12px var(--mono); color: var(--faint); display: flex; justify-content: space-between; }
+  ol.list { list-style: none; margin: 0; padding: 0; }
+  ol.list li { display: flex; gap: 10px; align-items: baseline; padding: 5px 0; font-size: 13.5px; }
+  ol.list input { accent-color: var(--accent); margin: 0; translate: 0 2px; }
+  ol.list a { color: inherit; text-decoration: none; }
+  ol.list a:hover { color: var(--accent); }
+  ol.list li.done a { color: var(--faint); text-decoration: line-through; }
+  .tools { display: flex; gap: 8px; margin-top: 18px; }
+  .ghost { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 5px 11px; font-size: 12.5px; cursor: pointer; color: var(--faint); }
+  .ghost:hover { color: var(--paper); border-color: var(--faint); }
+  section { border-top: 1px solid var(--line); padding: 30px 0 34px; scroll-margin-top: 16px; }
+  section:first-child { border-top: 0; padding-top: 0; }
+  .num { font: 12px var(--mono); color: var(--accent); }
+  h2 { font-size: 19px; font-weight: 600; margin: 2px 0 6px; }
+  .how { color: var(--faint); margin: 0 0 16px; max-width: 64ch; }
+  .how b { color: var(--paper); font-weight: 500; }
+  .stage { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px; min-height: 120px; }
+  .btn { background: var(--paper); color: #111; border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+  .btn:hover { background: #fff; }
+  .btn.alt { background: none; color: var(--paper); border: 1px solid var(--line); font-weight: 500; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .expect { font-size: 13px; color: var(--faint); margin-top: 12px; }
+  .expect::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 8px; translate: 0 -1px; }
+
+  .flash { position: absolute; right: 22px; top: 22px; background: #fff; color: #111; border-radius: 10px; padding: 12px 16px; font-weight: 600; box-shadow: 0 0 0 1px #0002; display: none; }
+  .flash small { display: block; font: 12px var(--mono); color: #555; font-weight: 400; }
+  .menu { position: absolute; left: 22px; top: 68px; width: 220px; background: #fbfaf7; color: #111; border-radius: 10px; padding: 6px; display: none; z-index: 2; }
+  .menu div { padding: 7px 10px; border-radius: 6px; font-size: 14px; }
+  .menu div:nth-child(2) { background: #e8e6e0; }
+  .menu hr { border: 0; border-top: 1px solid #ddd; margin: 5px 0; }
+  .wait { font: 13px var(--mono); color: var(--faint); }
+
+  .card { background: #fbfaf7; color: #161616; border-radius: 10px; padding: 18px 20px; max-width: 520px; font-size: 15px; }
+  .card h3 { margin: 0 0 10px; font-size: 16px; }
+  .card dl { display: grid; grid-template-columns: 110px 1fr; gap: 6px 14px; margin: 0; }
+  .card dt { color: #666; } .card dd { margin: 0; font-family: var(--mono); font-size: 14px; }
+  .card p { margin: 12px 0 0; color: #444; font-size: 14px; }
+
+  .article { display: grid; grid-template-columns: 1fr 220px; gap: 22px; background: #fbfaf7; color: #1a1a1a; border-radius: 10px; padding: 20px; }
+  .article p { margin: 0 0 10px; font-size: 14.5px; }
+  .chart { display: flex; align-items: flex-end; gap: 9px; height: 150px; padding: 12px; background: #fff; border: 1px solid #e3e1da; border-radius: 8px; }
+  .chart i { flex: 1; background: #1a1a1a; border-radius: 3px 3px 0 0; }
+  .chart i:nth-child(4) { background: var(--accent); }
+
+  .swatches { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+  .sw { height: 74px; border-radius: 8px; display: flex; align-items: flex-end; padding: 7px 9px; font: 12px var(--mono); color: #fff; text-shadow: 0 0 2px #0008; }
+  .field { background: #101010; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-family: var(--mono); width: 170px; outline: none; }
+  .field:focus { border-color: var(--faint); }
+  .verdict { font: 13px var(--mono); }
+  .verdict.ok { color: var(--ok); } .verdict.no { color: var(--accent); }
+
+  .boxes { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .box { background: #fbfaf7; color: #111; display: grid; place-items: center; font: 13px var(--mono); }
+  .island { background: #fbfaf7; border-radius: 10px; height: 230px; display: grid; place-items: center; }
+  .island b { display: block; width: 96px; height: 96px; background: #111; border-radius: 0; }
+
+  .dialog { background: #fbfaf7; color: #161616; border-radius: 12px; max-width: 480px; overflow: hidden; }
+  .dialog header { padding: 12px 16px; border-bottom: 1px solid #e3e1da; font-weight: 600; }
+  .dialog .body { padding: 14px 16px; display: grid; gap: 12px; }
+  .opt { display: flex; justify-content: space-between; align-items: center; font-size: 14.5px; }
+  .tog { width: 38px; height: 22px; border-radius: 11px; background: #cfcdc6; position: relative; }
+  .tog::after { content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; }
+  .tog.on { background: #111; } .tog.on::after { left: 19px; }
+  .dialog footer { padding: 12px 16px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid #e3e1da; }
+  .dialog footer span { padding: 6px 14px; border-radius: 7px; font-size: 14px; border: 1px solid #cfcdc6; }
+  .dialog footer span:last-child { background: #111; color: #fff; border-color: #111; }
+
+  .shapes { display: flex; gap: 26px; align-items: center; flex-wrap: wrap; }
+  .shape.sq { width: 120px; height: 120px; background: var(--accent); }
+  .shape.wide { width: 220px; height: 80px; background: #2f7bf6; }
+  .shape.round { width: 110px; height: 110px; border-radius: 50%; background: #fbfaf7; }
+  .shape.photo { width: 200px; height: 130px; background:
+      radial-gradient(circle at 30% 35%, #ffd60a 0 18%, transparent 19%),
+      repeating-linear-gradient(115deg, #1d3557 0 7px, #457b9d 7px 13px, #a8dadc 13px 21px, #e63946 21px 26px); }
+  .shape.outline { width: 180px; height: 96px; border: 2px solid #fbfaf7; display: grid; place-items: center; font: 13px var(--mono); color: var(--faint); }
+  .drop { border: 1px dashed var(--line); border-radius: 12px; padding: 26px; text-align: center; color: var(--faint); outline: none; }
+  .drop:focus { border-color: var(--accent); color: var(--paper); }
+  .drop img { max-width: 100%; max-height: 420px; display: block; margin: 14px auto 0; border: 1px solid var(--line); }
+  .size { font: 14px var(--mono); color: var(--paper); margin-top: 10px; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } aside { position: static; } .swatches { grid-template-columns: repeat(3, 1fr); } .article { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside>
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="6" fill="#000" stroke="#2a2a28"/>
+        <path d="M7 14V7h7M18 7h7v7M25 18v7h-7M14 25H7v-7" fill="none" stroke="#f2f0eb" stroke-width="3"/>
+        <rect x="13.5" y="13.5" width="5" height="5" fill="#ff4f1f"/>
+      </svg>
+      <h1>Bruma Lab</h1>
+    </div>
+    <p class="sub" data-en="A place to try every feature."></p>
+    <div class="hotkey" data-en="Hotkey: <kbd>PrintScreen</kbd>. If another program owns it, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>. Clicking the tray icon works too."></div>
+    <div class="count"><span data-en="Progress"></span><span id="count">0 / 0</span></div>
+    <div class="bar"><i id="bar"></i></div>
+    <ol class="list" id="list"></ol>
+    <div class="tools">
+      <button class="ghost" id="reset" data-en="Reset"></button>
+    </div>
+  </aside>
+
+  <main>
+    <section id="snap" data-en="Smart selection (snap)">
+      <div class="num">00</div><h2></h2>
+      <p class="how" data-en="Press the hotkey and move over the shapes: the box, circle or picture under the cursor is outlined by itself, and <b>one click</b> selects it. Then draw a <b>rough</b> rectangle around a shape: its edges snap to the shape's real edges. Resizing a selection by its edge snaps too. <kbd>G</kbd> turns snapping off and on; holding <kbd>Alt</kbd> suspends it."></p>
+      <div class="stage">
+        <div class="shapes">
+          <div class="shape sq"></div>
+          <div class="shape wide"></div>
+          <div class="shape round"></div>
+          <div class="shape photo"></div>
+          <div class="shape outline"><span data-en="outlined card"></span></div>
+        </div>
+        <div class="expect" data-en="The size label should read 120 × 120, 220 × 80, 110 × 110 and 200 × 130. Over the empty space between them the whole window is outlined."></div>
+      </div>
+    </section>
+
+    <section id="rewind" data-en="Rewind">
+      <div class="num">01</div><h2></h2>
+      <p class="how" data-en="Press the button; a message appears top right and is gone in 1.5 seconds. <b>After it has gone</b>, press the hotkey, turn the wheel back (or <kbd>PgUp</kbd>) and capture the message."></p>
+      <div class="stage">
+        <button class="btn" id="flashBtn" data-en="Show the message"></button>
+        <div class="flash" id="flash"><span data-en="Verification code"></span><small id="code">0000</small></div>
+        <div class="expect" data-en="If the code is readable in your capture, it worked. The pill at the top says how far back you are."></div>
+      </div>
+    </section>
+
+    <section id="changed" data-en="Select what changed">
+      <div class="num">02</div><h2></h2>
+      <p class="how" data-en="Press the button; a menu opens after 2 seconds. Then press the hotkey, keep the cursor near the menu and press <kbd>W</kbd>: the menu should be selected exactly, without dragging."></p>
+      <div class="stage" style="min-height: 250px">
+        <div class="row">
+          <button class="btn" id="menuBtn" data-en="Open the menu in 2 seconds"></button>
+          <button class="btn alt" id="menuClose" data-en="Close"></button>
+          <span class="wait" id="wait"></span>
+        </div>
+        <div class="menu" id="menu"><div data-en="New tab"></div><div data-en="New window"></div><hr><div data-en="History"></div><div data-en="Downloads"></div><div data-en="Settings"></div></div>
+        <div class="expect" style="position: absolute; left: 22px; bottom: 16px" data-en="The size label should read about 220 × 190."></div>
+      </div>
+    </section>
+
+    <section id="mask" data-en="Mask sensitive data, copy text">
+      <div class="num">03</div><h2></h2>
+      <p class="how" data-en="Select the card and press <kbd>M</kbd>: e-mail, phone, card number, IBAN, key, IP and password should blur; the name and the note stay readable. <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes them in one step. <kbd>X</kbd> copies the text in the selection."></p>
+      <div class="stage">
+        <div class="card">
+          <h3 data-en="Account details (all made up)"></h3>
+          <dl>
+            <dt data-en="Name"></dt><dd>Alex Morgan</dd>
+            <dt>E-mail</dt><dd>alex.morgan@example.com</dd>
+            <dt data-en="Phone"></dt><dd>0207 946 09 58</dd>
+            <dt data-en="Card"></dt><dd>4242 4242 4242 4242</dd>
+            <dt>IBAN</dt><dd>DE89370400440532013000</dd>
+            <dt>API key</dt><dd>sk-proj-a1B2c3D4e5F6g7H8</dd>
+            <dt>IP</dt><dd>192.168.1.42</dd>
+            <dt>Password:</dt><dd>hunter2-example</dd>
+          </dl>
+          <p data-en="Note: the meeting is on Thursday, together with release 2.4.1."></p>
+        </div>
+        <div class="expect" data-en="The rules are heuristics: they catch common formats, not everything. Check by eye before you share."></div>
+      </div>
+    </section>
+
+    <section id="focus" data-en="Focus and blur">
+      <div class="num">04</div><h2></h2>
+      <p class="how" data-en="Select the whole box. Draw over the chart with <kbd>O</kbd>: in the output only the chart stays sharp and the text turns to mist. Then blur a paragraph with <kbd>B</kbd>."></p>
+      <div class="stage">
+        <div class="article">
+          <div>
+            <p data-en="Usage grew markedly in the third quarter compared with the previous period. The biggest jump came in week four, with the new release."></p>
+            <p data-en="This paragraph is filler: it is here so there is text to go out of focus while you try the focus tool."></p>
+            <p data-en="Next steps: track the numbers weekly and repeat the comparison next quarter."></p>
+          </div>
+          <div class="chart"><i style="height:34%"></i><i style="height:48%"></i><i style="height:42%"></i><i style="height:92%"></i><i style="height:70%"></i><i style="height:76%"></i></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="colour" data-en="Colour picker and loupe">
+      <div class="num">05</div><h2></h2>
+      <p class="how" data-en="Press the hotkey, and <b>without selecting anything</b> hover a colour and press <kbd>C</kbd>. The colour code is copied; paste it into the box below to check it."></p>
+      <div class="stage">
+        <div class="swatches" id="swatches"></div>
+        <div class="row" style="margin-top: 16px">
+          <input class="field" id="hex" placeholder="#RRGGBB" spellcheck="false">
+          <span class="verdict" id="verdict"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="size" data-en="Size, windows and shrink to content">
+      <div class="num">06</div><h2></h2>
+      <p class="how" data-en="Try to select the boxes edge to edge; the size label should show the numbers written on them. Arrows nudge by one pixel, <kbd>Ctrl</kbd>+arrows resize. Select the light area below generously and press <kbd>S</kbd>: the selection should shrink to the black square, 96 × 96. One click on the browser window selects the whole window; <kbd>F</kbd> the whole monitor."></p>
+      <div class="stage">
+        <div class="boxes">
+          <div class="box" style="width:200px;height:120px">200 × 120</div>
+          <div class="box" style="width:64px;height:64px">64</div>
+          <div class="box" style="width:320px;height:40px">320 × 40</div>
+        </div>
+        <div class="island" style="margin-top: 18px"><b></b></div>
+      </div>
+    </section>
+
+    <section id="annotate" data-en="Annotation tools">
+      <div class="num">07</div><h2></h2>
+      <p class="how" data-en="Select the window and mark it up: number the three settings with <kbd>N</kbd>, point an arrow at Save with <kbd>A</kbd>, frame a row with <kbd>R</kbd>, write a note with <kbd>T</kbd>, highlight the title with <kbd>H</kbd>. <kbd>1</kbd>–<kbd>6</kbd> pick the ink, the wheel the width. Grab a drawing with <kbd>V</kbd> to move it, <kbd>Del</kbd> deletes it."></p>
+      <div class="stage">
+        <div class="dialog">
+          <header data-en="Notification settings"></header>
+          <div class="body">
+            <div class="opt"><span data-en="Desktop notifications"></span><span class="tog on"></span></div>
+            <div class="opt"><span data-en="Play a sound"></span><span class="tog"></span></div>
+            <div class="opt"><span data-en="Weekly summary e-mail"></span><span class="tog on"></span></div>
+          </div>
+          <footer><span data-en="Cancel"></span><span data-en="Save"></span></footer>
+        </div>
+      </div>
+    </section>
+
+    <section id="time" data-en="Clip and before/after">
+      <div class="num">00</div><h2></h2>
+      <p class="how" data-en="Press <b>Show the message</b> in the rewind station, and once the message has gone press the hotkey. <kbd>K</kbd> saves the last seconds as a GIF (you see the message come and go). Try again and press <kbd>J</kbd> this time: the two moments, with and without the message, are copied side by side with the change outlined."></p>
+      <div class="stage"><div class="expect" data-en="The GIF goes to the save folder (tray menu: Open screenshots folder). Paste the before/after picture into the area at the bottom to see it."></div></div>
+    </section>
+
+    <section id="scroll" data-en="Scrolling capture">
+      <div class="num">00</div><h2></h2>
+      <p class="how" data-en="Select a wide part of this page and press <kbd>Y</kbd>. Bruma scrolls the page for you and joins the pieces into one tall picture; it stops by itself at the end of the page, and <kbd>Esc</kbd> stops it early. Leave the mouse alone: Bruma is doing the scrolling."></p>
+      <div class="stage"><div class="expect" data-en="The preview card should show a picture taller than the screen. Headers that stay put and content that moves can spoil the join."></div></div>
+    </section>
+
+    <section id="extras" data-en="Ruler, frame, edit again, history">
+      <div class="num">00</div><h2></h2>
+      <p class="how" data-en="<kbd>Q</kbd> is the ruler: draw between two points and it writes the length in pixels (the box below is 320 px wide). <kbd>U</kbd> frames the capture: rounded corners, a shadow, a blurred background. <b>Double-click</b> a text you wrote to edit it again. Open a file saved with <kbd>Ctrl</kbd>+<kbd>S</kbd> later with <code>bruma edit file.png</code> and the drawings can still be moved. <b>History</b> in the tray menu shows past captures, searchable by the text in them. <kbd>Z</kbd> selects the region you used last."></p>
+      <div class="stage"><div class="boxes"><div class="box" style="width:320px;height:64px">320 px</div><div class="box" style="width:96px;height:96px">96</div></div></div>
+    </section>
+
+    <section id="paste" data-en="Check the output">
+      <div class="num">08</div><h2></h2>
+      <p class="how" data-en="Copy a capture with <kbd>Enter</kbd> (or double-click inside the selection). A <b>preview card</b> appears bottom right for a few seconds; click it to pin the capture on screen. Then click the area below and paste with <kbd>Ctrl</kbd>+<kbd>V</kbd>: you see exactly what went to the clipboard, and its size. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves a file, <kbd>P</kbd> pins directly. Whenever you are stuck, <kbd>F1</kbd> shows every key."></p>
+      <div class="drop" id="drop" tabindex="0">
+        <span data-en="Click here and paste"></span>
+        <div class="size" id="size"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let done = new Set(JSON.parse(localStorage.getItem('bruma-lab-done') || '[]'));
+const sections = [...document.querySelectorAll('main section')];
+
+function render() {
+  sections.forEach((s, i) => { s.querySelector('.num').textContent = String(i + 1).padStart(2, '0'); });
+  document.querySelectorAll('[data-en]').forEach((el) => {
+    if (el.tagName === 'SECTION') el.querySelector('h2').textContent = el.dataset.en;
+    else el.innerHTML = el.dataset.en;
+  });
+  $('list').innerHTML = '';
+  for (const s of sections) {
+    const li = document.createElement('li');
+    const box = Object.assign(document.createElement('input'), { type: 'checkbox', checked: done.has(s.id) });
+    box.addEventListener('change', () => { box.checked ? done.add(s.id) : done.delete(s.id); save(); });
+    const link = Object.assign(document.createElement('a'), { href: '#' + s.id, textContent: s.dataset.en });
+    li.className = done.has(s.id) ? 'done' : '';
+    li.append(box, link);
+    $('list').append(li);
+  }
+  $('count').textContent = done.size + ' / ' + sections.length;
+  $('bar').style.width = (100 * done.size / sections.length) + '%';
+}
+function save() { localStorage.setItem('bruma-lab-done', JSON.stringify([...done])); render(); }
+$('reset').onclick = () => { done.clear(); save(); };
+
+// 01: a message that is gone before you can reach the hotkey.
+$('flashBtn').onclick = () => {
+  $('code').textContent = String(Math.floor(1000 + Math.random() * 9000));
+  $('flash').style.display = 'block';
+  setTimeout(() => { $('flash').style.display = 'none'; }, 1500);
+};
+
+// 02: something that appears a moment after you ask for it.
+let timer;
+$('menuBtn').onclick = () => {
+  let left = 2;
+  $('menu').style.display = 'none';
+  $('wait').textContent = left + '…';
+  clearInterval(timer);
+  timer = setInterval(() => {
+    left -= 1;
+    $('wait').textContent = left > 0 ? left + '…' : '';
+    if (left <= 0) { clearInterval(timer); $('menu').style.display = 'block'; }
+  }, 1000);
+};
+$('menuClose').onclick = () => { clearInterval(timer); $('wait').textContent = ''; $('menu').style.display = 'none'; };
+
+// 05: swatches with known values, and a check for what the picker copied.
+const colours = ['#FF4F1F', '#2F7BF6', '#2FBF71', '#FFD60A', '#E5342B', '#7A5CFF'];
+for (const c of colours) {
+  const el = Object.assign(document.createElement('div'), { className: 'sw', textContent: c });
+  el.style.background = c;
+  $('swatches').append(el);
+}
+$('hex').addEventListener('input', () => {
+  const v = $('hex').value.trim().toUpperCase();
+  const hit = colours.indexOf(v);
+  const ok = 'correct: ';
+  const no = 'not one of these colours';
+  $('verdict').className = 'verdict ' + (hit >= 0 ? 'ok' : 'no');
+  $('verdict').textContent = v ? (hit >= 0 ? ok + (hit + 1) + '. ' + v : no) : '';
+});
+
+// 08: show exactly what is on the clipboard.
+document.addEventListener('paste', (e) => {
+  if (e.target === $('hex')) return;
+  const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
+  if (!item) { $('size').textContent = 'No image on the clipboard.'; return; }
+  const img = new Image();
+  img.onload = () => { $('size').textContent = img.naturalWidth + ' × ' + img.naturalHeight + ' px'; };
+  img.src = URL.createObjectURL(item.getAsFile());
+  $('drop').querySelector('img')?.remove();
+  $('drop').append(img);
+});
+
+render();
+</script>
+</body>
+</html>

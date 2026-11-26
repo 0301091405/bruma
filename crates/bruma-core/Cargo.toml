@@ -1,0 +1,14 @@
+[package]
+name = "bruma-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windowless core of bruma: capture session state machine and software renderer."
+
+[dependencies]
+tiny-skia.workspace = true
+fontdue = "0.9"
+fontdb = "0.24"
+png = "0.18"
