@@ -11,8 +11,9 @@
 
 ![Selecting a region, drawing on it, then going back one second for a tooltip that has closed](docs/demo.gif)
 
-Press the hotkey and the screen freezes. Drag a region or click a window, draw
-on it if you need to, press Enter. The picture is on your clipboard.
+Press the hotkey and the screen freezes. Drag a region or click a window and
+it's on your clipboard. To draw on it first, click the preview card that
+appears, or hold Shift as you let go of the mouse.
 
 If what you wanted was a tooltip or a menu that closed before you reached the
 hotkey, turn the mouse wheel. Bruma keeps the last four seconds of the screen
@@ -62,17 +63,27 @@ last few seconds. From there:
 
 - `W` selects whatever changed: the popup that just appeared, or the one that
   just went away.
-- `K` saves those seconds as a GIF.
+- `K` turns the last seconds into a GIF, at thirty pictures a second. It plays
+  in place before it's saved: drag the ends of the bar under it to trim it,
+  and anything you draw (text, arrows, blur) goes on every frame. `Enter`
+  copies it, and it pastes into chats and folders as a file. Press `K` before
+  you choose the area to go straight to the GIF.
 - `J` puts two moments side by side with the difference outlined, which is
   usually what a bug report needs.
 
 ![The overlay one second in the past, with a closed tooltip selected](docs/rewind.png)
 
+![A GIF in the making: it plays in the selection, with a label drawn on it and a bar to trim it](docs/gif.png)
+
 ### Snap
 
 Point at a button, a box or a picture and it gets an outline; click to select
-it. If you drag instead, the edges settle on the nearest real edge. This works
-from the pixels, so it doesn't matter what kind of program is underneath.
+it. Inside a window the larger parts count too, such as the page of a browser
+or the body of a site: `Tab` steps out from the box under the cursor to the
+part around it and then to the whole window, `Shift+Tab` steps back. If you
+drag instead, the edges settle on the nearest real edge. This works from the
+pixels and the window layout, so it doesn't matter what kind of program is
+underneath.
 `G` turns it off, holding `Alt` suspends it.
 
 ![Pointing at a button outlines the button](docs/snap.png)
@@ -117,12 +128,15 @@ before you send it.
 
 | Key | |
 |---|---|
-| drag | select a region |
-| click | select the box, picture or window under the cursor |
+| drag | copy a region |
+| click | copy the box, picture or window under the cursor |
+| `Tab`, `Shift+Tab` | a larger or smaller area around the cursor |
+| `Shift` while letting go | keep it open to draw on |
 | `F`, `Z` | whole monitor, the region used last time |
 | `S` | shrink the selection to its content |
 | wheel, `PgUp` `PgDn` | rewind |
 | `W` `J` `K` | select what changed, before/after picture, GIF |
+| `Space` | play or pause a GIF |
 | `V` `A` `L` `R` `E` | select, arrow, line, rectangle, ellipse |
 | `D` `H` `T` `N` | pen, highlighter, text, numbered step |
 | `B` `O` `Q` | blur, focus, ruler |
@@ -149,15 +163,23 @@ bruma mask shot.png                 blur private text in an existing PNG
 bruma ocr shot.png                  print the text in a PNG
 bruma lab                           open a page for trying every feature
 bruma probe                         time screen reads on this machine
+bruma settings                      show the settings of the running Bruma
 ```
 
 If another program already owns `PrintScreen`, Bruma falls back to
-`Ctrl+PrintScreen`, then `Ctrl+Alt+B`, and says which one in the tray menu.
+`Ctrl+PrintScreen`, then `Ctrl+Alt+B`, and says so in its tray menu.
+
+A left click on the tray icon takes a capture; a right click opens the menu.
 
 ## Settings
 
-Everything is optional. "Settings" in the tray menu opens
-`%APPDATA%\bruma\config.toml` and creates it with the defaults if it's missing.
+Right-click the tray icon and choose Settings. Changes apply as soon as you
+make them.
+
+![The settings panel over the misted screen](docs/settings.png)
+
+Everything is kept in `%APPDATA%\bruma\config.toml`. A few things are only in
+that file; "Edit the settings file" at the bottom of the panel opens it.
 
 ```toml
 hotkey    = "PrintScreen"               # or "ctrl+shift+KeyS"
@@ -169,6 +191,8 @@ snap      = true
 autosave  = false                       # also save a file on every copy
 preview   = 4                           # seconds the preview card stays
 rewind    = 4                           # seconds of screen history, 0 = off
+clip      = 10                          # seconds kept for GIFs, 0 = off
+quick     = true                        # copy as soon as an area is chosen
 rewind_fullscreen = false               # record while a game or film is full screen
 fast_capture = true                     # false = always read the screen with GDI
 cursor    = false                       # include the mouse cursor
@@ -181,16 +205,19 @@ run_after = ""                          # 'curl -s -F "file=@{file}" https://exa
 On a 1080p monitor the frozen screen is up 25 to 30 ms after the hotkey. A
 frame while you drag or draw takes 2 to 4 ms.
 
-Rewind is the only part that works while you aren't using it. It samples the
-screen twice a second at low priority and takes a bit under 1% of one core
-while the screen keeps changing, close to nothing when it doesn't. It stops
-while a game or a film is full screen. Memory is 8 MB when the screen is still
-and up to about 100 MB when it changes all the time. `rewind = 0` turns it off.
+Rewind is the only part that works while you aren't using it. For GIFs it
+looks at the screen thirty times a second at low priority, but it only reads
+and keeps the parts that changed. That takes about 1% of one core while
+something keeps moving and close to nothing when nothing does. It stops while a
+game or a film is full screen. Memory is a few MB while the screen is still;
+when it changes all the time the stills take up to about 100 MB and the GIF
+recording is capped at 320 MB. `clip = 0` stops the GIF recording, `rewind = 0`
+turns rewinding off.
 
 ## What it doesn't do
 
-- No video recording. `K` gives you the last few seconds at two frames a
-  second and that's all.
+- No video recording. `K` gives you up to the last ten seconds as a GIF and
+  that's all.
 - No built-in upload services. Use `run_after`.
 - No Linux or macOS yet. The core doesn't depend on Windows, the app does.
 - It has mostly been tested on one 1080p monitor. Multiple monitors and

@@ -35,6 +35,8 @@ pub enum Command {
     Help,
     /// Time the two ways of reading the screen and compare what they see.
     Probe,
+    /// Ask the running Bruma to show its settings.
+    Settings,
     Version,
 }
 
@@ -65,6 +67,7 @@ USAGE
   bruma history                        browse and search past captures
   bruma find WORDS                     list past captures containing the words
   bruma probe                          time the ways of reading the screen
+  bruma settings                       show the settings of the running Bruma
   bruma --help | --version
 
 Without -o, files go to the configured save folder.
@@ -114,6 +117,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("-h" | "--help" | "help") => Ok(Command::Help),
         Some("-V" | "--version" | "version") => Ok(Command::Version),
         Some("probe") => Ok(Command::Probe),
+        Some("settings") => Ok(Command::Settings),
         Some("lab") => Ok(Command::Lab),
         Some("autostart") => match it.next() {
             None | Some("status") => Ok(Command::Autostart(None)),
@@ -312,5 +316,6 @@ mod tests {
         assert_eq!(parse(&args("--help")), Ok(Command::Help));
         assert_eq!(parse(&args("-V")), Ok(Command::Version));
         assert_eq!(parse(&args("probe")), Ok(Command::Probe));
+        assert_eq!(parse(&args("settings")), Ok(Command::Settings));
     }
 }

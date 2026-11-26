@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use bruma_core::clip::{Clip, Cursor};
 use bruma_core::doc::Annotation;
 use bruma_core::render::Renderer;
 use bruma_core::session::{Effect, Frame, Input, Key, Mods, Options, Prefs, Session};
@@ -40,7 +41,28 @@ pub struct Overlay {
     cursor: Point,
     /// When and where the left button last went down, to spot a double click.
     last_press: Option<(Instant, Point)>,
+    /// The recording of the selection while a GIF is being made, and where
+    /// playing it has got to.
+    clip: Option<(Clip, Cursor)>,
+    /// The moment of the recording on screen.
+    shown_at: Option<u64>,
+    /// When the GIF's playback last moved on.
+    ticked: Instant,
 }
+
+/// A capture just copied, kept a little while so that it can be opened
+/// again to draw on.
+pub struct Snapshot {
+    pub screen: std::sync::Arc<Image>,
+    pub origin: (i32, i32),
+    pub windows: Vec<Rect>,
+    pub monitors: Vec<Rect>,
+    pub selection: Rect,
+    pub scale: f32,
+}
+
+/// Time between two pictures of a GIF playing.
+const CLIP_FRAME: Duration = Duration::from_millis(33);
 
 /// The screen an overlay was showing, for messages that outlive it.
 pub struct Scene {
@@ -112,7 +134,7 @@ impl Shell {
 }
 
 /// The Win32 handle of a window.
-fn window_handle(window: &Window) -> Option<isize> {
+pub fn window_handle(window: &Window) -> Option<isize> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
@@ -154,7 +176,12 @@ impl Overlay {
             .unwrap_or_default();
 
         let local = |r: Rect| r.translate(-origin.0 as f32, -origin.1 as f32);
-        let windows = platform::windows().into_iter().map(local).collect();
+        let (windows, panes) = platform::windows_and_panes();
+        let windows = windows.into_iter().map(local).collect();
+        let panes: Vec<(Rect, Rect)> = panes
+            .into_iter()
+            .map(|(owner, pane)| (local(owner), local(pane)))
+            .collect();
         let monitors = event_loop
             .available_monitors()
             .map(|m| {
@@ -191,13 +218,14 @@ impl Overlay {
             }
         }
         // What was set during the last capture wins over the settings file.
-        let session = Session::new(
+        let mut session = Session::new(
             frames,
             fonts,
             windows,
             monitors,
-            Self::options(config, prefs, scale),
+            Self::options(config, prefs, scale, config.quick),
         );
+        session.set_panes(panes);
         // Build the dimmed screen and the glass on another core while the
         // window is being made.
         let (newest, index) = (session.present(), session.frame_index());
@@ -208,7 +236,7 @@ impl Overlay {
         Self::show(event_loop, session, origin, size, started, layers, shell)
     }
 
-    fn options(config: &Config, prefs: Option<Prefs>, scale: f32) -> Options {
+    fn options(config: &Config, prefs: Option<Prefs>, scale: f32, quick: bool) -> Options {
         Options {
             scale,
             color: prefs.map_or(config.color_index(), |p| p.color),
@@ -216,7 +244,132 @@ impl Overlay {
             snap: prefs.map_or(config.snap, |p| p.snap),
             framed: prefs.is_some_and(|p| p.framed),
             last: prefs.and_then(|p| p.last),
+            quick,
         }
+    }
+
+    /// Opens a capture just copied again, the same picture and area, to draw
+    /// on it.
+    pub fn reopen(
+        event_loop: &ActiveEventLoop,
+        fonts: Rc<Fonts>,
+        config: &Config,
+        prefs: Option<Prefs>,
+        shell: Option<Shell>,
+        snapshot: Snapshot,
+    ) -> Result<Self, String> {
+        let started = Instant::now();
+        let size = PhysicalSize::new(snapshot.screen.width, snapshot.screen.height);
+        let scale = snapshot.scale;
+        let mut session = Session::new(
+            vec![Frame {
+                image: snapshot.screen,
+                age_ms: 0,
+            }],
+            fonts,
+            snapshot.windows,
+            snapshot.monitors,
+            Self::options(config, prefs, scale, false),
+        );
+        session.select(snapshot.selection);
+        let (newest, index) = (session.present(), session.frame_index());
+        let layers = std::thread::Builder::new()
+            .name("bruma-layers".into())
+            .spawn(move || Renderer::prepare(&newest, index, scale))
+            .ok();
+        Self::show(
+            event_loop,
+            session,
+            snapshot.origin,
+            size,
+            started,
+            layers,
+            shell,
+        )
+    }
+
+    /// What it takes to open this capture again, if an area is chosen.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        Some(Snapshot {
+            screen: self.session.current(),
+            origin: self.origin,
+            windows: self.session.windows().to_vec(),
+            monitors: self.session.monitors().to_vec(),
+            selection: self.session.selection()?,
+            scale: self.session.scale(),
+        })
+    }
+
+    /// Starts making a GIF of the selection from `clip`.
+    pub fn start_clip(&mut self, clip: Clip) {
+        self.session.enter_clip(clip.length(), clip.rate());
+        self.clip = Some((clip, Cursor::default()));
+        self.shown_at = None;
+        self.ticked = Instant::now();
+        self.sync_clip();
+    }
+
+    /// A clip of `area` from the few pictures a second the rewind keeps, for
+    /// when nothing finer was recorded.
+    pub fn still_clip(&self, area: Rect) -> Option<Clip> {
+        let frames = self.session.frames();
+        if frames.len() < 2 {
+            return None;
+        }
+        let oldest = frames[0].age_ms as u64;
+        let crops: Vec<(Image, u64)> = frames
+            .iter()
+            .map(|f| {
+                (
+                    f.image.crop(area),
+                    oldest - f.age_ms.min(oldest as u32) as u64,
+                )
+            })
+            .collect();
+        let pictures: Vec<(&Image, u64)> = crops.iter().map(|(i, t)| (i, *t)).collect();
+        Clip::from_pictures(&pictures, oldest.max(1))
+    }
+
+    /// The recording of the GIF being made, to write it.
+    pub fn take_clip(&mut self) -> Option<Clip> {
+        self.clip.take().map(|(clip, _)| clip)
+    }
+
+    /// A short message on the overlay.
+    pub fn say(&mut self, text: &str) {
+        self.session.say(text);
+        self.window.request_redraw();
+    }
+
+    /// Moves the GIF being made on; says when to come back.
+    pub fn tick(&mut self) -> Option<Instant> {
+        self.session.clip()?;
+        let now = Instant::now();
+        let ms = now.duration_since(self.ticked).as_millis().min(1000) as u32;
+        if ms >= CLIP_FRAME.as_millis() as u32 {
+            self.ticked = now;
+            self.session.handle(Input::Tick(ms));
+            self.sync_clip();
+        }
+        Some(self.ticked + CLIP_FRAME)
+    }
+
+    /// Puts the picture of the moment the session wants to show on screen.
+    fn sync_clip(&mut self) {
+        let Some(t) = self.session.clip_time() else {
+            return;
+        };
+        if self.shown_at == Some(t) {
+            return;
+        }
+        let Some((clip, cursor)) = self.clip.as_mut() else {
+            return;
+        };
+        clip.seek(cursor, t);
+        let picture = clip.picture(cursor);
+        self.session.show_clip_frame(std::sync::Arc::new(picture));
+        self.shown_at = Some(t);
+        self.window.request_redraw();
     }
 
     /// Opens an earlier capture for editing: the picture sits in the middle of
@@ -269,7 +422,7 @@ impl Overlay {
             })
             .collect();
         let whole = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
-        let options = Self::options(config, None, scale);
+        let options = Self::options(config, None, scale, false);
         let mut session = Session::new(
             vec![Frame::now(canvas)],
             fonts,
@@ -316,6 +469,9 @@ impl Overlay {
             mods: Mods::default(),
             cursor,
             last_press: None,
+            clip: None,
+            shown_at: None,
+            ticked: Instant::now(),
         };
         // Draw the first picture while the window is still hidden, so that
         // once it shows there is only the copy to the screen left to do.
@@ -393,7 +549,9 @@ impl Overlay {
     /// Hands the session something that did not come from the window, such as
     /// recognised words.
     pub fn feed(&mut self, input: Input) -> Vec<Effect> {
-        self.session.handle(input)
+        let effects = self.session.handle(input);
+        self.sync_clip();
+        effects
     }
 
     pub fn hide(&self) {
@@ -426,6 +584,7 @@ impl Overlay {
     pub fn on_event(&mut self, event: WindowEvent) -> Vec<Effect> {
         let before = self.session.frame_index();
         let effects = self.translate(event);
+        self.sync_clip();
         let after = self.session.frame_index();
         if after != before {
             note(|| {
@@ -548,6 +707,7 @@ fn key(key: &WinitKey) -> Option<Key> {
         WinitKey::Named(NamedKey::F1) => Key::Help,
         WinitKey::Named(NamedKey::PageUp) => Key::PageUp,
         WinitKey::Named(NamedKey::PageDown) => Key::PageDown,
+        WinitKey::Named(NamedKey::Tab) => Key::Tab,
         WinitKey::Character(s) => Key::Char(s.chars().next()?.to_lowercase().next()?),
         _ => return None,
     })

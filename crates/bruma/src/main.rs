@@ -12,8 +12,10 @@ mod pin;
 mod platform;
 mod rewind;
 mod scroll;
+mod stage;
 mod toast;
 mod tray;
+mod traymenu;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -269,6 +271,13 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Probe => probe().map(|report| print!("{report}")),
+        Command::Settings => {
+            if platform::request_settings() {
+                Ok(())
+            } else {
+                Err("Bruma is not running; start it, then try again".into())
+            }
+        }
         Command::Lab => lab::open().map(|path| println!("{}", path.display())),
         Command::Autostart(None) => {
             let state = if platform::autostart_enabled() {

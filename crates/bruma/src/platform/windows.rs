@@ -32,10 +32,10 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ASFW_ANY, AllowSetForegroundWindow, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
-    GetMessagePos, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
+    ASFW_ANY, AllowSetForegroundWindow, EnumChildWindows, EnumWindows, GWL_EXSTYLE, GetClassNameW,
+    GetCursorPos, GetMessagePos, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, w};
 
@@ -347,6 +347,47 @@ pub fn attention() -> Attention {
 struct WindowScan {
     own_pid: u32,
     rects: Vec<Rect>,
+    /// Parts of the front-most windows, each with its window.
+    panes: Vec<(Rect, Rect)>,
+}
+
+/// Only the front windows are searched for parts, and only so many parts are
+/// kept: a browser or an editor has a handful, and the search must stay quick.
+const PANE_WINDOWS: usize = 8;
+const MAX_PANES: usize = 96;
+
+struct PaneScan<'a> {
+    owner: Rect,
+    panes: &'a mut Vec<(Rect, Rect)>,
+}
+
+/// A visible child window large enough to be a part worth selecting: the page
+/// of a browser, the text of an editor, the list in a file window.
+unsafe extern "system" fn scan_pane(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let scan = &mut *(lparam.0 as *mut PaneScan);
+        if scan.panes.len() >= MAX_PANES {
+            return false.into();
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return true.into();
+        }
+        let pane = Rect::new(
+            rect.left as f32,
+            rect.top as f32,
+            (rect.right - rect.left) as f32,
+            (rect.bottom - rect.top) as f32,
+        )
+        .intersect(&scan.owner);
+        if pane.w >= 120.0 && pane.h >= 80.0 {
+            scan.panes.push((scan.owner, pane));
+        }
+        true.into()
+    }
 }
 
 unsafe extern "system" fn scan_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -392,22 +433,31 @@ unsafe extern "system" fn scan_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         }
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
         if w >= 8 && h >= 8 {
-            scan.rects.push(Rect::new(
-                rect.left as f32,
-                rect.top as f32,
-                w as f32,
-                h as f32,
-            ));
+            let owner = Rect::new(rect.left as f32, rect.top as f32, w as f32, h as f32);
+            scan.rects.push(owner);
+            if scan.rects.len() <= PANE_WINDOWS {
+                let mut panes = PaneScan {
+                    owner,
+                    panes: &mut scan.panes,
+                };
+                let _ = EnumChildWindows(
+                    Some(hwnd),
+                    Some(scan_pane),
+                    LPARAM(&mut panes as *mut PaneScan as isize),
+                );
+            }
         }
         true.into()
     }
 }
 
-/// Visible top-level windows in desktop coordinates, front-most first.
-pub fn windows() -> Vec<Rect> {
+/// Visible top-level windows in desktop coordinates, front-most first, and
+/// the larger parts of the front ones, each with its window.
+pub fn windows_and_panes() -> (Vec<Rect>, Vec<(Rect, Rect)>) {
     let mut scan = WindowScan {
         own_pid: unsafe { GetCurrentProcessId() },
         rects: Vec::new(),
+        panes: Vec::new(),
     };
     unsafe {
         let _ = EnumWindows(
@@ -415,7 +465,7 @@ pub fn windows() -> Vec<Rect> {
             LPARAM(&mut scan as *mut WindowScan as isize),
         );
     }
-    scan.rects
+    (scan.rects, scan.panes)
 }
 
 /// The mouse cursor in desktop coordinates.
@@ -605,6 +655,41 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         EmptyClipboard().map_err(|e| format!("clipboard clear: {e}"))?;
     }
     clipboard.set(CF_UNICODETEXT.0 as u32, &wide)
+}
+
+/// Puts files on the clipboard, the way Explorer's Copy does: pasted into a
+/// chat or a folder, they arrive as files. A GIF goes this way, since there
+/// is no picture format for moving pictures.
+pub fn copy_files(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::DROPFILES;
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.as_os_str().encode_wide());
+        names.push(0);
+    }
+    names.push(0);
+    let header = DROPFILES {
+        pFiles: size_of::<DROPFILES>() as u32,
+        pt: POINT::default(),
+        fNC: false.into(),
+        fWide: true.into(),
+    };
+    let mut bytes = Vec::with_capacity(size_of::<DROPFILES>() + names.len() * 2);
+    // SAFETY: DROPFILES is plain data; its bytes are what the clipboard wants.
+    bytes.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &header as *const DROPFILES as *const u8,
+            size_of::<DROPFILES>(),
+        )
+    });
+    bytes.extend(names.iter().flat_map(|c| c.to_le_bytes()));
+    let clipboard = OpenedClipboard::open()?;
+    unsafe {
+        EmptyClipboard().map_err(|e| format!("clipboard clear: {e}"))?;
+    }
+    clipboard.set(CF_HDROP.0 as u32, &bytes)
 }
 
 // ---- text recognition --------------------------------------------------------
@@ -822,4 +907,334 @@ pub fn set_cursor_position(x: i32, y: i32) {
 pub fn escape_pressed() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
     unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+// ---- for Bruma's own windows --------------------------------------------------
+
+/// The part of the monitor at `point` that windows may use, without the
+/// taskbar: x, y, width, height.
+pub fn work_area(point: (i32, i32)) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(
+            POINT {
+                x: point.0,
+                y: point.1,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let r = info.rcWork;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+}
+
+/// The window in front, the one the keyboard goes to.
+pub fn foreground_window() -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+/// Asks for a folder with the system's own dialog, starting in `start`.
+/// `None` when the person cancels.
+pub fn pick_folder(owner: Option<isize>, start: &std::path::Path) -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem,
+        SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    };
+    use windows::core::HSTRING;
+    unsafe {
+        // Already set up on this thread by the window library; harmless if so.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog
+            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
+            .ok()?;
+        let _ = std::fs::create_dir_all(start);
+        if let Ok(folder) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start.as_os_str()), None)
+        {
+            let _ = dialog.SetFolder(&folder);
+        }
+        let owner = owner.map(|h| HWND(h as *mut c_void));
+        dialog.Show(owner).ok()?;
+        let chosen = dialog.GetResult().ok()?;
+        let name = chosen.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const c_void));
+        path.map(std::path::PathBuf::from)
+    }
+}
+
+const SETTINGS_REQUEST: windows::core::PCWSTR = w!("Local\\bruma-settings-request");
+
+/// Asks the background process to show its settings. `false` when there is
+/// none.
+pub fn request_settings() -> bool {
+    unsafe {
+        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, SETTINGS_REQUEST) else {
+            return false;
+        };
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let sent = SetEvent(event).is_ok();
+        let _ = CloseHandle(event);
+        sent
+    }
+}
+
+/// Background side of [`request_settings`].
+pub fn listen_for_settings_requests(on_request: impl Fn() + Send + 'static) -> bool {
+    let Ok(event) = (unsafe { CreateEventW(None, false, false, SETTINGS_REQUEST) }) else {
+        return false;
+    };
+    let raw = event.0 as isize;
+    std::thread::Builder::new()
+        .name("bruma-settings-requests".into())
+        .spawn(move || {
+            let event = HANDLE(raw as *mut c_void);
+            while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 {
+                on_request();
+            }
+        })
+        .is_ok()
+}
+
+// ---- the icon in the notification area ---------------------------------------
+
+/// A click on the tray icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayClick {
+    /// A left click, or Enter on the icon.
+    Left,
+    /// A right click, or the menu key on the icon, at this place on the screen.
+    Right((i32, i32)),
+}
+
+/// The message the shell sends the icon's window about the icon.
+const TRAY_MESSAGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+
+struct TrayState {
+    on_click: Box<dyn Fn(TrayClick)>,
+    data: windows::Win32::UI::Shell::NOTIFYICONDATAW,
+    /// Sent to every window when Explorer (re)starts: the icon must be added
+    /// again then.
+    taskbar_created: u32,
+}
+
+thread_local! {
+    static TRAY: std::cell::RefCell<Option<TrayState>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The size Windows draws notification icons at, in pixels.
+pub fn small_icon_size() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::SM_CXSMICON;
+    unsafe { GetSystemMetrics(SM_CXSMICON).clamp(16, 64) as u32 }
+}
+
+/// An icon from straight RGBA pixels, `size` by `size`.
+fn icon_from_rgba(
+    rgba: &[u8],
+    size: u32,
+) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON, String> {
+    use windows::Win32::Graphics::Gdi::CreateBitmap;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+    if rgba.len() != (size * size * 4) as usize {
+        return Err("the icon has the wrong size".into());
+    }
+    unsafe {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size as i32,
+                biHeight: -(size as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+            .map_err(|e| e.to_string())?;
+        if bits.is_null() {
+            let _ = DeleteObject(color.into());
+            return Err("could not make the icon".into());
+        }
+        let out = std::slice::from_raw_parts_mut(bits as *mut u8, rgba.len());
+        for (o, p) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+            o.copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+        }
+        // An empty mask: the alpha in the colour bitmap decides.
+        let mask = CreateBitmap(size as i32, size as i32, 1, 1, None);
+        let icon = CreateIconIndirect(&ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        });
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon.map_err(|e| e.to_string())
+    }
+}
+
+/// Puts the icon in the notification area and asks for the shell's newer,
+/// simpler way of reporting clicks.
+fn show_tray_icon(data: &windows::Win32::UI::Shell::NOTIFYICONDATAW) -> bool {
+    use windows::Win32::UI::Shell::{NIM_ADD, NIM_SETVERSION, Shell_NotifyIconW};
+    unsafe {
+        Shell_NotifyIconW(NIM_ADD, data).as_bool()
+            && Shell_NotifyIconW(NIM_SETVERSION, data).as_bool()
+    }
+}
+
+unsafe extern "system" fn tray_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Shell::NIN_SELECT;
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_CONTEXTMENU};
+    if msg == TRAY_MESSAGE {
+        // The newer reporting: the event in the low word, and where it
+        // happened in `wparam`.
+        let event = lparam.0 as u32 & 0xFFFF;
+        let x = (wparam.0 & 0xFFFF) as u16 as i16 as i32;
+        let y = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+        let click = match event {
+            e if e == NIN_SELECT || e == NIN_SELECT + 1 => Some(TrayClick::Left),
+            WM_CONTEXTMENU => Some(TrayClick::Right((x, y))),
+            _ => None,
+        };
+        if let Some(click) = click {
+            TRAY.with(|tray| {
+                if let Some(state) = &*tray.borrow() {
+                    (state.on_click)(click);
+                }
+            });
+        }
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+    let again = TRAY.with(|tray| {
+        tray.borrow()
+            .as_ref()
+            .filter(|state| state.taskbar_created != 0 && msg == state.taskbar_created)
+            .map(|state| state.data)
+    });
+    if let Some(data) = again {
+        show_tray_icon(&data);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// The icon in the notification area. Only one at a time, on the thread
+/// that runs the window loop; it goes away when dropped.
+pub struct NotifyIcon {
+    hwnd: HWND,
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+}
+
+impl NotifyIcon {
+    pub fn new(
+        rgba: &[u8],
+        size: u32,
+        tip: &str,
+        on_click: impl Fn(TrayClick) + 'static,
+    ) -> Result<Self, String> {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Shell::{
+            NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, RegisterClassW, RegisterWindowMessageW, WINDOW_EX_STYLE, WNDCLASSW,
+            WS_POPUP,
+        };
+        unsafe {
+            let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+            let class = w!("bruma_tray");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(tray_proc),
+                hInstance: instance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            // Fails harmlessly if the class is already there.
+            RegisterClassW(&wc);
+            // A real (hidden) window rather than a message-only one: those
+            // do not hear that Explorer has restarted.
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class,
+                w!("bruma tray"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            let icon = icon_from_rgba(rgba, size)?;
+            let mut data = NOTIFYICONDATAW {
+                cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+                uCallbackMessage: TRAY_MESSAGE,
+                hIcon: icon,
+                ..Default::default()
+            };
+            for (slot, c) in data.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
+                *slot = c;
+            }
+            data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+            TRAY.with(|tray| {
+                *tray.borrow_mut() = Some(TrayState {
+                    on_click: Box::new(on_click),
+                    data,
+                    taskbar_created,
+                });
+            });
+            // Early at sign-in the taskbar may not be there yet; the icon is
+            // added when Explorer says it has started.
+            show_tray_icon(&data);
+            Ok(Self { hwnd, icon })
+        }
+    }
+}
+
+impl Drop for NotifyIcon {
+    fn drop(&mut self) {
+        use windows::Win32::UI::Shell::{NIM_DELETE, Shell_NotifyIconW};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DestroyWindow};
+        let data = TRAY.with(|tray| tray.borrow_mut().take().map(|state| state.data));
+        unsafe {
+            if let Some(data) = data {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            }
+            let _ = DestroyIcon(self.icon);
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
 }

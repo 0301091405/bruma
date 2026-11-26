@@ -1,30 +1,24 @@
-//! Tray icon, its menu, and the global hotkey.
+//! Tray icon and the global hotkey. A left click on the icon takes a
+//! capture; a right click asks for Bruma's own menu.
 
 use bruma_core::theme::{ACCENT, INK, PAPER};
 use bruma_core::tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
+use crate::platform::{self, NotifyIcon, TrayClick};
 
 pub struct Tray {
-    _icon: TrayIcon,
-    _hotkeys: Option<GlobalHotKeyManager>,
-    pub capture: MenuId,
-    pub folder: MenuId,
-    pub lab: MenuId,
-    pub later: MenuId,
-    pub history: MenuId,
-    pub settings: MenuId,
-    /// The "Start with Windows" tick.
-    pub autostart: CheckMenuItem,
-    pub quit: MenuId,
-    /// The hotkey that takes a capture, in plain words; `None` when neither
-    /// the configured one nor a fallback could be had.
-    pub hotkey: Option<String>,
+    _icon: NotifyIcon,
+    manager: Option<GlobalHotKeyManager>,
+    /// The hotkey registered now, and its name in the settings file's words.
+    registered: Option<(HotKey, String)>,
+    /// Why the configured hotkey is not the one in use.
+    pub problem: Option<String>,
+    /// Whether the hotkey has been let go of by [`Tray::pause`].
+    paused: bool,
 }
 
 /// The bruma mark: a viewfinder. Four crop marks and one accent pixel, on ink.
@@ -109,74 +103,22 @@ pub fn mark(size: u32) -> Vec<u8> {
 }
 
 impl Tray {
-    /// Creates the tray icon and registers `hotkey`. A hotkey that cannot be
-    /// registered is reported in the menu instead of failing.
-    pub fn new(
-        proxy: EventLoopProxy<UserEvent>,
-        hotkey: &str,
-        autostart_on: bool,
-    ) -> Result<Self, String> {
+    /// Creates the tray icon and registers `hotkey`, or a fallback if another
+    /// program has it.
+    pub fn new(proxy: EventLoopProxy<UserEvent>, hotkey: &str) -> Result<Self, String> {
         let registration = register(hotkey);
-        let label = match &registration.active {
-            Some(active) => format!("Capture\t{active}"),
-            None => "Capture".to_string(),
-        };
-        let capture = MenuItem::new(label, true, None);
-        let folder = MenuItem::new("Open screenshots folder", true, None);
-        let lab = MenuItem::new("Open test lab", true, None);
-        let later = MenuItem::new("Capture in 3 seconds", true, None);
-        let history = MenuItem::new("History", true, None);
-        let settings = MenuItem::new("Settings", true, None);
-        let autostart = CheckMenuItem::new("Start with Windows", true, autostart_on, None);
-        let quit = MenuItem::new("Quit bruma", true, None);
-        let menu = Menu::new();
-        let separator = PredefinedMenuItem::separator();
-        let mut build = menu.append(&capture).and_then(|_| menu.append(&later));
         if let Some(problem) = &registration.problem {
             eprintln!("bruma: {problem}");
-            let note = MenuItem::new(
-                format!("{} is taken by another app", pretty(hotkey)),
-                false,
-                None,
-            );
-            build = build.and_then(|_| menu.append(&note));
         }
-        let hotkey = registration.active.clone();
-        let hotkeys = registration.manager;
-        build
-            .and_then(|_| menu.append(&folder))
-            .and_then(|_| menu.append(&lab))
-            .and_then(|_| menu.append(&history))
-            .and_then(|_| menu.append(&settings))
-            .and_then(|_| menu.append(&autostart))
-            .and_then(|_| menu.append(&separator))
-            .and_then(|_| menu.append(&quit))
-            .map_err(|e| e.to_string())?;
-
-        let icon = Icon::from_rgba(mark(32), 32, 32).map_err(|e| e.to_string())?;
-        let tray = TrayIconBuilder::new()
-            .with_icon(icon)
-            .with_tooltip("bruma")
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let menu_proxy = proxy.clone();
-        MenuEvent::set_event_handler(Some(std::sync::Arc::new(move |event: MenuEvent| {
-            let _ = menu_proxy.send_event(UserEvent::Menu(event.id));
-        })));
+        let size = platform::small_icon_size();
         let click_proxy = proxy.clone();
-        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let _ = click_proxy.send_event(UserEvent::Capture);
-            }
-        }));
+        let icon = NotifyIcon::new(&mark(size), size, "Bruma", move |click| {
+            let event = match click {
+                TrayClick::Left => UserEvent::Capture,
+                TrayClick::Right((x, y)) => UserEvent::TrayMenu((x, y, 1, 1)),
+            };
+            let _ = click_proxy.send_event(event);
+        })?;
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
             if event.state() == HotKeyState::Pressed {
                 let _ = proxy.send_event(UserEvent::Capture);
@@ -184,18 +126,68 @@ impl Tray {
         }));
 
         Ok(Self {
-            _icon: tray,
-            _hotkeys: hotkeys,
-            capture: capture.id().clone(),
-            folder: folder.id().clone(),
-            lab: lab.id().clone(),
-            later: later.id().clone(),
-            history: history.id().clone(),
-            settings: settings.id().clone(),
-            autostart,
-            quit: quit.id().clone(),
-            hotkey,
+            _icon: icon,
+            manager: registration.manager,
+            registered: registration.active,
+            problem: registration.problem,
+            paused: false,
         })
+    }
+
+    /// The hotkey that takes a capture, as people write it.
+    pub fn hotkey(&self) -> Option<String> {
+        self.registered.as_ref().map(|(_, name)| pretty(name))
+    }
+
+    /// Lets go of the hotkey for a moment, so that pressing it reaches a
+    /// window instead (the settings, listening for a new one).
+    pub fn pause(&mut self) {
+        if self.paused {
+            return;
+        }
+        if let (Some(manager), Some((key, _))) = (&self.manager, &self.registered) {
+            let _ = manager.unregister(*key);
+        }
+        self.paused = true;
+    }
+
+    /// Takes the hotkey back after [`Tray::pause`].
+    pub fn resume(&mut self) {
+        if !self.paused {
+            return;
+        }
+        if let (Some(manager), Some((key, _))) = (&self.manager, &self.registered) {
+            let _ = manager.register(*key);
+        }
+        self.paused = false;
+    }
+
+    /// Changes the hotkey to `wanted`. When that is not possible the old one
+    /// stays, and the reason is returned.
+    pub fn set_hotkey(&mut self, wanted: &str) -> Result<(), String> {
+        let parsed: HotKey = wanted
+            .parse()
+            .map_err(|_| format!("{} cannot be a hotkey", pretty(wanted)))?;
+        let manager = self.manager.as_ref().ok_or("hotkeys are not available")?;
+        if let Some((old, _)) = &self.registered {
+            if !self.paused {
+                let _ = manager.unregister(*old);
+            }
+        }
+        self.paused = false;
+        match manager.register(parsed) {
+            Ok(()) => {
+                self.registered = Some((parsed, wanted.to_string()));
+                self.problem = None;
+                Ok(())
+            }
+            Err(_) => {
+                if let Some((old, _)) = &self.registered {
+                    let _ = manager.register(*old);
+                }
+                Err(format!("{} is taken by another app", pretty(wanted)))
+            }
+        }
     }
 }
 
@@ -204,8 +196,8 @@ const FALLBACK_HOTKEYS: &[&str] = &["ctrl+PrintScreen", "ctrl+alt+KeyB"];
 
 struct Registration {
     manager: Option<GlobalHotKeyManager>,
-    /// The hotkey that actually works, if any.
-    active: Option<String>,
+    /// The hotkey that actually works, if any, and its name.
+    active: Option<(HotKey, String)>,
     /// Why the configured hotkey is not the active one.
     problem: Option<String>,
 }
@@ -221,31 +213,34 @@ fn register(wanted: &str) -> Registration {
             };
         }
     };
-    let attempt = |name: &str| -> Result<(), String> {
+    let attempt = |name: &str| -> Result<HotKey, String> {
         let parsed: HotKey = name
             .parse()
-            .map_err(|_| format!("hotkey '{name}' is not a key combination bruma understands"))?;
+            .map_err(|_| format!("hotkey '{name}' is not a key combination Bruma understands"))?;
         manager
             .register(parsed)
-            .map_err(|_| format!("hotkey {} is in use by another program", pretty(name)))
+            .map(|()| parsed)
+            .map_err(|_| format!("{} is taken by another app", pretty(name)))
     };
     let problem = match attempt(wanted) {
-        Ok(()) => {
+        Ok(key) => {
             return Registration {
                 manager: Some(manager),
-                active: Some(pretty(wanted)),
+                active: Some((key, wanted.to_string())),
                 problem: None,
             };
         }
         Err(problem) => problem,
     };
-    let active = FALLBACK_HOTKEYS
-        .iter()
-        .find(|name| !name.eq_ignore_ascii_case(wanted) && attempt(name).is_ok())
-        .map(|name| pretty(name));
+    let active = FALLBACK_HOTKEYS.iter().find_map(|name| {
+        if name.eq_ignore_ascii_case(wanted) {
+            return None;
+        }
+        attempt(name).ok().map(|key| (key, name.to_string()))
+    });
     let problem = match &active {
-        Some(active) => format!("{problem}; using {active} instead"),
-        None => format!("{problem}, and so are the fallbacks; set 'hotkey' in the settings file"),
+        Some((_, name)) => format!("{problem}; using {} instead", pretty(name)),
+        None => format!("{problem}; choose another in Settings"),
     };
     Registration {
         manager: Some(manager),
@@ -256,25 +251,7 @@ fn register(wanted: &str) -> Registration {
 
 /// `ctrl+alt+KeyB` → `Ctrl+Alt+B`, for showing to people.
 pub fn pretty(hotkey: &str) -> String {
-    hotkey
-        .split('+')
-        .map(|part| {
-            let part = part.trim();
-            let lower = part.to_ascii_lowercase();
-            match lower.as_str() {
-                "ctrl" | "control" => "Ctrl".to_string(),
-                "alt" | "option" => "Alt".to_string(),
-                "shift" => "Shift".to_string(),
-                "super" | "cmd" | "command" | "win" => "Win".to_string(),
-                _ => match (lower.strip_prefix("key"), lower.strip_prefix("digit")) {
-                    (Some(letter), _) if letter.len() == 1 => letter.to_ascii_uppercase(),
-                    (_, Some(digit)) if digit.len() == 1 => digit.to_string(),
-                    _ => part.to_string(),
-                },
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("+")
+    bruma_core::settings::pretty(hotkey)
 }
 
 #[cfg(test)]

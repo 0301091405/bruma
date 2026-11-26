@@ -23,6 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bruma_core::Image;
+use bruma_core::clip::{Area, Clip, Tape};
 use bruma_core::session::Frame;
 
 use crate::platform::{Attention, Duplicator, Grabber, Raw};
@@ -31,6 +32,13 @@ use crate::{note, platform};
 const INTERVAL: Duration = Duration::from_millis(500);
 /// How often the recorder wakes to see whether a sample is due.
 const TICK: Duration = Duration::from_millis(100);
+/// How often it looks while keeping the screen for GIFs: thirty times a
+/// second.
+const FAST_TICK: Duration = Duration::from_millis(33);
+/// Upper bound on memory held for GIFs. Only a screen that changes all over,
+/// all the time (a video, full screen) comes near it; it then keeps fewer
+/// seconds.
+const TAPE_BUDGET: usize = 320 * 1024 * 1024;
 /// A screen that has not changed and a user who has touched nothing for this
 /// long are sampled at the quiet pace.
 const QUIET_AFTER: Duration = Duration::from_secs(2);
@@ -68,6 +76,14 @@ struct Shared {
     stopped: AtomicBool,
     resume_at: Mutex<Instant>,
     window: Duration,
+    /// The screen for GIFs, and the desktop position of its top-left pixel.
+    tape: Mutex<Option<(Tape, (i32, i32))>>,
+    /// The tape's clock counts milliseconds from here.
+    epoch: Instant,
+    /// How much the tape keeps; zero for no tape.
+    clip: Duration,
+    /// When recording stopped for the overlay on screen: where a GIF ends.
+    paused_at: Mutex<Option<Instant>>,
 }
 
 /// How long to wait between two samples. Things appear and vanish because
@@ -194,6 +210,8 @@ struct Eyes {
     grabber: Option<Grabber>,
     /// Duplication is not asked for again before this moment.
     ask_at: Instant,
+    /// The duplicated picture has changed since the last look.
+    unseen: bool,
 }
 
 impl Eyes {
@@ -203,6 +221,7 @@ impl Eyes {
             duplicator: None,
             grabber: None,
             ask_at: Instant::now(),
+            unseen: false,
         }
     }
 
@@ -230,26 +249,31 @@ impl Eyes {
         }
     }
 
-    /// Reads the screen. The flag says that the screen is known not to have
-    /// changed since the last look. `patient` allows the time it takes to
-    /// set duplication up; a capture that is waiting does not have it.
-    fn look(&mut self, plain: bool, patient: bool) -> Option<(Raw<'_>, bool)> {
-        if patient || !(self.fast && plain) {
-            self.get_ready(plain);
-        }
-        let same = match self.duplicator.as_mut().map(Duplicator::refresh) {
-            Some(Ok(changed)) => Some(!changed),
-            Some(Err(())) => {
+    /// Brings the duplicated picture up to date. `Some(true)` when something
+    /// changed; `None` without duplication.
+    fn poll(&mut self) -> Option<bool> {
+        match self.duplicator.as_mut()?.refresh() {
+            Ok(changed) => {
+                self.unseen |= changed;
+                Some(changed)
+            }
+            Err(()) => {
                 // Lost: the desktop changed, or something took the monitor.
                 self.duplicator = None;
                 self.ask_at = Instant::now() + QUIET_INTERVAL;
                 note(|| "rewind: desktop duplication lost".into());
                 None
             }
-            None => None,
-        };
-        if let (Some(same), Some(duplicator)) = (same, &self.duplicator) {
+        }
+    }
+
+    /// Reads the screen. The flag says that the screen is known not to have
+    /// changed since the last look. With duplication the picture is the one
+    /// [`Eyes::poll`] brought up to date.
+    fn look(&mut self) -> Option<(Raw<'_>, bool)> {
+        if let Some(duplicator) = &self.duplicator {
             self.grabber = None;
+            let same = !std::mem::take(&mut self.unseen);
             return Some((duplicator.raw(), same));
         }
         if self.grabber.is_none() {
@@ -276,6 +300,40 @@ struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
+    /// Brings the duplicated picture up to date and puts what changed on
+    /// the tape.
+    fn refresh(&mut self, now: Instant) {
+        let Some(changed) = self.eyes.poll() else {
+            return;
+        };
+        if self.shared.clip.is_zero() {
+            return;
+        }
+        let Some(duplicator) = self.eyes.duplicator.as_ref() else {
+            return;
+        };
+        let raw = duplicator.raw();
+        let (w, h) = (raw.width as usize, raw.height as usize);
+        let ms = now.duration_since(self.shared.epoch).as_millis() as u64;
+        let Ok(mut tape) = self.shared.tape.lock() else {
+            return;
+        };
+        match tape.as_mut() {
+            Some((tape, origin)) if tape.size() == (w, h) && *origin == raw.origin => {
+                if changed {
+                    tape.record(raw.bytes, duplicator.dirty(), ms);
+                }
+            }
+            _ => {
+                let keep = self.shared.clip.as_millis() as u64 + 1000;
+                *tape = Some((
+                    Tape::new(raw.bytes, w, h, ms, keep, TAPE_BUDGET),
+                    raw.origin,
+                ));
+            }
+        }
+    }
+
     /// Looks at the screen and files what it sees: a new frame, or the
     /// newest one seen again. Returns that frame, the present moment.
     /// `urgent`: a capture is waiting, so be quick rather than cheap.
@@ -283,7 +341,12 @@ impl Recorder<'_> {
         let started = Instant::now();
         let window = self.shared.window;
         let plain = attention == Attention::Desktop && !platform::captures_cursor();
-        let Some((raw, same)) = self.eyes.look(plain, !urgent) else {
+        // Setting duplication up takes a moment a waiting capture does not have.
+        if !urgent || !(self.eyes.fast && plain) {
+            self.eyes.get_ready(plain);
+        }
+        self.refresh(started);
+        let Some((raw, same)) = self.eyes.look() else {
             self.in_step = false;
             return None;
         };
@@ -358,8 +421,32 @@ fn run(shared: &Shared, requests: mpsc::Receiver<Request>, in_fullscreen: bool, 
         changed_at: Instant::now(),
     };
     let mut sampled_at = Instant::now();
+    // For GIFs the screen is looked at on a steady beat of thirty a second.
+    // Waiting on the channel would wake on the system's coarse clock (every
+    // 15.6 ms), turning 33 ms into 47; a plain sleep is precise.
+    let steady = !shared.clip.is_zero();
+    let mut beat = Instant::now();
     loop {
-        match requests.recv_timeout(TICK) {
+        let request = if steady {
+            let now = Instant::now();
+            if beat > now {
+                thread::sleep(beat - now);
+            }
+            beat += FAST_TICK;
+            let now = Instant::now();
+            if beat < now {
+                // Fell behind (the machine was busy): start the beat again.
+                beat = now + FAST_TICK;
+            }
+            match requests.try_recv() {
+                Ok(reply) => Ok(reply),
+                Err(mpsc::TryRecvError::Empty) => Err(mpsc::RecvTimeoutError::Timeout),
+                Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+            }
+        } else {
+            requests.recv_timeout(TICK)
+        };
+        match request {
             Ok(reply) => {
                 let shot = recorder.sample(platform::attention(), true);
                 let _ = reply.send(shot);
@@ -380,12 +467,16 @@ fn run(shared: &Shared, requests: mpsc::Receiver<Request>, in_fullscreen: bool, 
             break;
         }
         let now = Instant::now();
-        let since = now.duration_since(sampled_at);
-        if since < INTERVAL {
-            continue;
-        }
         let waiting = shared.resume_at.lock().is_ok_and(|t| now < *t);
         if shared.paused.load(Ordering::Relaxed) || waiting {
+            continue;
+        }
+        // The tape, between the samples.
+        if !shared.clip.is_zero() && recorder.eyes.duplicator.is_some() {
+            recorder.refresh(now);
+        }
+        let since = now.duration_since(sampled_at);
+        if since < INTERVAL {
             continue;
         }
         let due = if records {
@@ -426,12 +517,12 @@ impl Rewind {
     /// through Desktop Duplication where possible, and the recorder then
     /// serves captures even when `seconds` is zero and nothing is recorded.
     /// `None` when there is nothing for it to do.
-    pub fn start(seconds: f32, in_fullscreen: bool, fast: bool) -> Option<Self> {
-        let seconds = if seconds.is_nan() {
-            0.0
-        } else {
-            seconds.clamp(0.0, 30.0)
-        };
+    pub fn start(seconds: f32, in_fullscreen: bool, fast: bool, clip: f32) -> Option<Self> {
+        let sane = |v: f32, most: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, most) };
+        let seconds = sane(seconds, 30.0);
+        // GIFs need the quick way of reading the screen: it is what says
+        // which parts changed.
+        let clip = if fast { sane(clip, 10.0) } else { 0.0 };
         if seconds <= 0.0 && !fast {
             return None;
         }
@@ -441,6 +532,10 @@ impl Rewind {
             stopped: AtomicBool::new(false),
             resume_at: Mutex::new(Instant::now()),
             window: Duration::from_secs_f32(seconds),
+            tape: Mutex::new(None),
+            epoch: Instant::now(),
+            clip: Duration::from_secs_f32(clip),
+            paused_at: Mutex::new(None),
         });
         let worker = shared.clone();
         let (requests, inbox) = mpsc::channel();
@@ -469,14 +564,43 @@ impl Rewind {
 
     /// Stops sampling while an overlay is on screen.
     pub fn pause(&self) {
-        self.shared.paused.store(true, Ordering::Relaxed);
+        if !self.shared.paused.swap(true, Ordering::Relaxed) {
+            if let Ok(mut at) = self.shared.paused_at.lock() {
+                *at = Some(Instant::now());
+            }
+        }
     }
 
     pub fn resume(&self) {
         if let Ok(mut at) = self.shared.resume_at.lock() {
             *at = Instant::now() + SETTLE;
         }
+        if let Ok(mut at) = self.shared.paused_at.lock() {
+            *at = None;
+        }
         self.shared.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// The last seconds of `area` of the desktop picture whose top-left
+    /// pixel is at `origin`, up to when recording stopped for the overlay,
+    /// at the pace they were recorded. `None` when nothing was kept for it.
+    pub fn clip(&self, area: Area, origin: (i32, i32)) -> Option<Clip> {
+        let guard = self.shared.tape.lock().ok()?;
+        let (tape, tape_origin) = guard.as_ref()?;
+        if *tape_origin != origin {
+            return None;
+        }
+        let end = self
+            .shared
+            .paused_at
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .unwrap_or_else(Instant::now);
+        let end = end.duration_since(self.shared.epoch).as_millis() as u64;
+        let from = end.saturating_sub(self.shared.clip.as_millis() as u64);
+        let clip = tape.clip(area, from, end)?;
+        (clip.length() > 0).then_some(clip)
     }
 
     /// Recorded frames that differ from the capture `now`, oldest first.
@@ -615,9 +739,9 @@ mod tests {
 
     #[test]
     fn zero_seconds_switches_rewind_off() {
-        assert!(Rewind::start(0.0, false, false).is_none());
-        assert!(Rewind::start(-1.0, false, false).is_none());
-        assert!(Rewind::start(f32::NAN, false, false).is_none());
+        assert!(Rewind::start(0.0, false, false, 0.0).is_none());
+        assert!(Rewind::start(-1.0, false, false, 5.0).is_none());
+        assert!(Rewind::start(f32::NAN, false, false, f32::NAN).is_none());
     }
 
     #[test]

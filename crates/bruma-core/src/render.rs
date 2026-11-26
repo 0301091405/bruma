@@ -80,7 +80,7 @@ fn build_quarter(screen: &Image) -> blur::Buf {
     )
 }
 
-fn build_glass(quarter: &blur::Buf, scale: f32) -> Option<Pixmap> {
+pub(crate) fn build_glass(quarter: &blur::Buf, scale: f32) -> Option<Pixmap> {
     let mut small = quarter.clone();
     blur::blur(&mut small, (5.0 * scale).round().max(2.0) as usize, 3);
     IntSize::from_wh(small.w as u32, small.h as u32)
@@ -156,11 +156,11 @@ impl Renderer {
         self.mist = Some(blur::upscale(&small, w, h, theme::SOFT_KEEP));
     }
 
-    /// Builds every cached layer now, so the first selection does not stall.
+    /// Builds the cached layers now, so the first selection does not stall.
+    /// The mist is left until the focus tool asks for it.
     pub fn warm(&mut self, s: &Session) {
         self.sync(s);
         self.ensure_glass(s);
-        self.ensure_mist(s);
     }
 
     /// Draws the whole overlay. `pixmap` must be the size of the screen.
@@ -173,29 +173,10 @@ impl Renderer {
         self.sync(s);
         self.ensure_glass(s);
         let selection = s.selection();
-        if selection.is_some() {
-            self.ensure_mist(s);
-        }
-        let Some(glass) = self.glass.as_ref() else {
-            return;
-        };
-        let scale = s.scale();
-        let line = scale.round().max(1.0);
-
-        // In focus: the selection, or the window about to be selected.
-        let backdrop = match (&self.mist, selection) {
-            (Some(mist), Some(_)) => mist,
-            _ => &self.dim,
-        };
-        pixmap.data_mut().copy_from_slice(backdrop);
-        let lit = selection.or_else(|| s.hover_target());
-        if let Some(rect) = lit {
-            copy_rows(pixmap, &screen.rgba, screen, rect);
-        }
-        // The focus tool: inside the selection only the focus areas stay sharp,
-        // exactly as the exported image will look.
-        if let (Some(sel), Some(mist)) = (selection, &self.mist) {
-            let focus: Vec<Rect> = s
+        // The focus tool: inside the selection only the focus areas stay
+        // sharp, exactly as the exported image will look.
+        let focus: Vec<Rect> = match selection {
+            Some(_) => s
                 .doc()
                 .items()
                 .iter()
@@ -204,7 +185,31 @@ impl Renderer {
                     Shape::Focus { rect } => Some(rect),
                     _ => None,
                 })
-                .collect();
+                .collect(),
+            None => Vec::new(),
+        };
+        if !focus.is_empty() {
+            self.ensure_mist(s);
+        }
+        let Some(glass) = self.glass.as_ref() else {
+            return;
+        };
+        let scale = s.scale();
+        let line = scale.round().max(1.0);
+
+        // Around the selection the screen stays sharp, only a little dimmed,
+        // so that nothing is hidden; the selection itself is at full
+        // brightness.
+        pixmap.data_mut().copy_from_slice(&self.dim);
+        let lit = selection.or_else(|| s.hover_target());
+        if let Some(rect) = lit {
+            copy_rows(pixmap, &screen.rgba, screen, rect);
+        }
+        // A GIF in the making plays inside the selection.
+        if let (Some(sel), Some(picture)) = (selection, s.clip_frame()) {
+            paste(pixmap, picture, sel.round().intersect(&screen.bounds()));
+        }
+        if let (Some(sel), Some(mist)) = (selection, &self.mist) {
             if !focus.is_empty() {
                 copy_rows(pixmap, mist, screen, sel);
                 for rect in focus {
@@ -257,8 +262,11 @@ impl Renderer {
         }
 
         let rewound = s.frame_index() + 1 != s.frame_count();
-        if s.frame_count() > 1 && (s.selecting() || rewound) {
+        if s.clip().is_none() && s.frame_count() > 1 && (s.selecting() || rewound) {
             timeline(pixmap, glass, s);
+        }
+        if let (Some(view), Some(bar)) = (s.clip(), s.clip_bar()) {
+            clip_bar(pixmap, glass, s.fonts(), view, &bar, scale);
         }
         let monitor = s.monitor_of(s.pointer());
         if let Some(text) = s.notice() {
@@ -266,10 +274,17 @@ impl Renderer {
             pill(pixmap, glass, s.fonts(), text, rect, scale);
         } else if selection.is_none() && !s.help() {
             // Nothing selected yet: say what can be done.
-            let text = if s.snap() {
-                "Drag to select    Click a box or window    F1 keys"
-            } else {
-                "Drag to select    Click a window    F1 keys"
+            let text = match (s.quick(), s.snap()) {
+                (true, true) => {
+                    "Drag or click a box to copy    Tab for a larger area    Shift to draw first    K for a GIF    F1 keys"
+                }
+                (true, false) => {
+                    "Drag or click a window to copy    Shift to draw first    K for a GIF    F1 keys"
+                }
+                (false, true) => {
+                    "Drag to select    Click a box or window    Tab for a larger area    F1 keys"
+                }
+                (false, false) => "Drag to select    Click a window    F1 keys",
             };
             let rect = pill_rect(s.fonts(), text, monitor, scale);
             pill(pixmap, glass, s.fonts(), text, rect, scale);
@@ -285,6 +300,7 @@ const KEYS: [&[(&str, &str)]; 2] = [
     &[
         ("drag", "select a region"),
         ("click", "select the box or window"),
+        ("Tab", "larger area, Shift smaller"),
         ("F", "whole monitor"),
         ("S", "shrink to content"),
         ("G", "snap on / off"),
@@ -607,6 +623,120 @@ pub fn toast(
     }
 }
 
+/// Puts `picture` into the frame with its top-left corner at the corner of
+/// `area`, cut to `area`.
+fn paste(pixmap: &mut Pixmap, picture: &Image, area: Rect) {
+    let (fw, fh) = (pixmap.width() as i64, pixmap.height() as i64);
+    let (x0, y0) = (area.x as i64, area.y as i64);
+    let w = (area.w as i64)
+        .min(picture.width as i64)
+        .min(fw - x0)
+        .max(0) as usize;
+    let h = (area.h as i64)
+        .min(picture.height as i64)
+        .min(fh - y0)
+        .max(0) as usize;
+    if w == 0 || x0 < 0 || y0 < 0 {
+        return;
+    }
+    let stride = fw as usize * 4;
+    let data = pixmap.data_mut();
+    for y in 0..h {
+        let from = y * picture.width as usize * 4;
+        let to = (y0 as usize + y) * stride + x0 as usize * 4;
+        data[to..to + w * 4].copy_from_slice(&picture.rgba[from..from + w * 4]);
+    }
+}
+
+/// The bar under a GIF in the making: play and pause, the recording laid out
+/// along a track, the part kept between two handles, and how long it is.
+fn clip_bar(
+    pixmap: &mut Pixmap,
+    glass: &Pixmap,
+    fonts: &Fonts,
+    view: &crate::session::ClipView,
+    bar: &crate::session::ClipBar,
+    scale: f32,
+) {
+    let px = |v: f32| (v * scale).round();
+    glass_panel(pixmap, glass, bar.rect, bar.rect.h / 2.0, scale);
+
+    // Play is a triangle; pause, two bars.
+    let c = bar.play.center();
+    let r = px(6.0);
+    if view.playing {
+        for dx in [-px(3.5), px(3.5)] {
+            fill_rect(
+                pixmap,
+                Rect::new((c.x + dx - px(1.5)).round(), c.y - r, px(3.0), 2.0 * r),
+                PAPER,
+                1.0,
+            );
+        }
+    } else {
+        let mut pb = PathBuilder::new();
+        pb.move_to(c.x - r * 0.7, c.y - r);
+        pb.line_to(c.x + r, c.y);
+        pb.line_to(c.x - r * 0.7, c.y + r);
+        pb.close();
+        if let Some(path) = pb.finish() {
+            fill_path(pixmap, &path, PAPER, 1.0);
+        }
+    }
+
+    let track = bar.track;
+    let mid = track.y + track.h / 2.0;
+    let t = px(2.0).max(2.0);
+    // The whole recording, faint; the part kept, bright.
+    fill_rect(
+        pixmap,
+        Rect::new(track.x, (mid - t / 2.0).round(), track.w, t),
+        PAPER,
+        0.25,
+    );
+    let (a, b) = (bar.x_of(view.from), bar.x_of(view.to));
+    fill_rect(
+        pixmap,
+        Rect::new(a, (mid - t / 2.0).round(), (b - a).max(1.0), t),
+        ACCENT,
+        1.0,
+    );
+    // The handles.
+    for x in [a, b] {
+        let handle = Rect::new((x - px(3.0)).round(), track.y, px(6.0), track.h);
+        if let Some(path) = rounded_rect(handle, px(3.0)) {
+            fill_path(pixmap, &path, PAPER, 1.0);
+        }
+    }
+    // The moment shown.
+    let at = bar.x_of(view.at);
+    fill_rect(
+        pixmap,
+        Rect::new(
+            at.round(),
+            track.y + px(3.0),
+            px(1.5).max(1.0),
+            track.h - px(6.0),
+        ),
+        PAPER,
+        0.85,
+    );
+
+    let seconds = (view.to - view.from) as f32 / 1000.0;
+    let text = if view.rate > 0 {
+        format!("{seconds:.1} s  {} fps", view.rate)
+    } else {
+        format!("{seconds:.1} s")
+    };
+    let size = px(12.0);
+    let (tw, th) = fonts.measure(Face::Mono, &text, size);
+    let at = Point::new(
+        (bar.rect.right() - px(18.0) - tw).round(),
+        (bar.rect.y + (bar.rect.h - th) / 2.0).round(),
+    );
+    fonts.draw(pixmap, Face::Mono, &text, size, at, PAPER);
+}
+
 /// Copies the pixels under `rect` from `source`, a buffer the size of the
 /// screen, into the frame.
 fn copy_rows(pixmap: &mut Pixmap, source: &[u8], screen: &Image, rect: Rect) {
@@ -728,7 +858,13 @@ fn glass_shape(pixmap: &mut Pixmap, glass: &Pixmap, path: &Path, rim: Option<&Pa
     }
 }
 
-fn glass_panel(pixmap: &mut Pixmap, glass: &Pixmap, rect: Rect, radius: f32, scale: f32) {
+pub(crate) fn glass_panel(
+    pixmap: &mut Pixmap,
+    glass: &Pixmap,
+    rect: Rect,
+    radius: f32,
+    scale: f32,
+) {
     let t = scale.round().max(1.0);
     let Some(path) = rounded_rect(rect, radius) else {
         return;
@@ -1139,18 +1275,34 @@ mod tests {
     }
 
     #[test]
-    fn outside_the_selection_is_mist() {
+    fn outside_the_selection_stays_sharp_and_is_only_dimmed() {
         let mut s = session(1.0);
         select(&mut s);
         let frame = render(&s);
-        // Far from any edge the mist is simply the dimmed colour…
-        assert_eq!(frame.pixel(20, 440)[0], scaled(200, theme::SOFT_KEEP));
-        // …and the window's hard edge at x = 100 has become a soft ramp.
-        let (dark, light) = (scaled(200, theme::SOFT_KEEP), scaled(240, theme::SOFT_KEEP));
-        let at_edge = frame.pixel(100, 160)[0];
-        assert!(
-            at_edge > dark && at_edge < light,
-            "edge value {at_edge} is between {dark} and {light}"
+        assert_eq!(frame.pixel(20, 440)[0], scaled(200, theme::DIM_KEEP));
+        // The window's hard edge at x = 100 is still hard: no blur.
+        assert_eq!(frame.pixel(99, 160)[0], scaled(200, theme::DIM_KEEP));
+        assert_eq!(frame.pixel(101, 160)[0], scaled(240, theme::DIM_KEEP));
+    }
+
+    #[test]
+    fn a_gif_in_the_making_plays_in_the_selection_with_its_bar() {
+        let mut s = session(1.0);
+        select(&mut s);
+        s.handle(Input::Key(Key::Char('k'), Mods::default()));
+        s.enter_clip(3000, 30);
+        let sel = s.selection().unwrap();
+        let picture = Image::filled(sel.w as u32, sel.h as u32, [10, 200, 30, 255]);
+        s.show_clip_frame(std::sync::Arc::new(picture));
+        let frame = render(&s);
+        let inside = frame.pixel((sel.x + 20.0) as i32, (sel.y + 20.0) as i32);
+        assert_eq!(inside, [10, 200, 30, 255]);
+        let bar = s.clip_bar().unwrap();
+        let (a, mid) = (bar.x_of(1500), bar.track.center().y);
+        assert_eq!(
+            frame.pixel(a as i32, mid as i32)[..3],
+            ACCENT,
+            "the part kept is lit"
         );
     }
 

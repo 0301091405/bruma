@@ -10,21 +10,22 @@ use bruma_core::doc::Annotation;
 use bruma_core::redact;
 use bruma_core::session::{Effect, Input, Prefs};
 use bruma_core::text::Fonts;
-use tray_icon::menu::MenuId;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::config::Config;
-use crate::overlay::{Overlay, Scene, Shell};
+use crate::overlay::{Overlay, Scene, Shell, Snapshot};
 use crate::pin::{Pin, PinAction};
 use crate::rewind::Rewind;
 use crate::toast::{BRIEF, PinRequest, Toast, ToastAction};
 
 /// How long the message of the very first start stays.
 const WELCOME: Duration = Duration::from_secs(6);
+use crate::stage::{Stage, StageEvent};
 use crate::tray::Tray;
+use crate::traymenu::{MenuAction, TrayMenu};
 use crate::{history, lab, platform, scroll, write_png_with};
 
 #[derive(Debug)]
@@ -32,8 +33,18 @@ pub enum UserEvent {
     /// The hotkey, the tray icon, the tray menu or another process asked for
     /// a capture.
     Capture,
-    Menu(MenuId),
+    /// A right click on the tray icon, whose place (x, y, width, height) is
+    /// given.
+    TrayMenu((i32, i32, i32, i32)),
+    /// Another process asked for the settings.
+    Settings,
+    /// A GIF has been written (or not), from this many milliseconds of
+    /// recording; `true` if it was only to be saved.
+    GifDone(Result<std::path::PathBuf, String>, bool, u64),
 }
+
+/// Where the source code is.
+const SOURCE: &str = "https://github.com/0301091405/bruma";
 
 /// A saved capture being edited again: where it lives, the picture as it was
 /// before anything was drawn on it, and the drawings.
@@ -41,30 +52,6 @@ pub struct EditJob {
     pub path: std::path::PathBuf,
     pub original: Image,
     pub items: Vec<Annotation>,
-}
-
-/// Encodes frames, each shown for the given milliseconds, as a looping GIF.
-fn encode_gif(frames: &[(Image, u32)]) -> Result<Vec<u8>, String> {
-    let first = &frames.first().ok_or("nothing to make a clip from")?.0;
-    let too_big = |_| "the area is too large for a GIF".to_string();
-    let (w, h) = (
-        u16::try_from(first.width).map_err(too_big)?,
-        u16::try_from(first.height).map_err(too_big)?,
-    );
-    let mut out = Vec::new();
-    {
-        let mut encoder = gif::Encoder::new(&mut out, w, h, &[]).map_err(|e| e.to_string())?;
-        encoder
-            .set_repeat(gif::Repeat::Infinite)
-            .map_err(|e| e.to_string())?;
-        for (image, shown_ms) in frames {
-            let mut rgba = image.rgba.clone();
-            let mut frame = gif::Frame::from_rgba_speed(w, h, &mut rgba, 10);
-            frame.delay = (*shown_ms / 10).clamp(2, u16::MAX as u32) as u16;
-            encoder.write_frame(&frame).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(out)
 }
 
 /// Writes a guide beside a saved capture: the picture and an empty numbered
@@ -137,6 +124,14 @@ struct App {
     pins: HashMap<WindowId, Pin>,
     toast: Option<Toast>,
     tray: Option<Tray>,
+    /// The intro or the settings, over a whole monitor.
+    stage: Option<Stage>,
+    /// The capture just copied, while its preview card is up: a click on the
+    /// card opens it again to draw on.
+    again: Option<Snapshot>,
+    /// GIFs being written in the background.
+    gifs: usize,
+    menu: Option<TrayMenu>,
     rewind: Option<Rewind>,
     /// Ink, stroke and snap as the last capture left them.
     prefs: Option<Prefs>,
@@ -148,7 +143,8 @@ struct App {
 
 impl App {
     fn open_overlay(&mut self, event_loop: &ActiveEventLoop) {
-        if self.overlay.is_some() {
+        // Nothing of Bruma's own may end up in the capture.
+        if self.overlay.is_some() || self.stage.is_some() || self.menu.is_some() {
             return;
         }
         // A message from the last capture must not be part of this one. The
@@ -156,6 +152,7 @@ impl App {
         // still show a message closed this instant; GDI waits for the
         // compositor, so such a capture is read the slow way.
         let had_message = self.toast.take().is_some();
+        self.again = None;
         // Stop recording first: the overlay must never end up in its own past.
         if let Some(rewind) = &self.rewind {
             rewind.pause();
@@ -234,6 +231,7 @@ impl App {
             overlay.hide();
         }
         let scene = overlay.context();
+        let mut snapshot = overlay.snapshot();
         let mut message: Option<Message> = None;
         // Sent just ahead of a save: what makes the file editable, and its steps.
         let mut source: Option<(Image, Vec<Annotation>)> = None;
@@ -255,6 +253,7 @@ impl App {
                         self.save(&image, None, None);
                     }
                     self.remember(&image);
+                    self.again = snapshot.take();
                     message = Some(Message::Shot(caption, image));
                 }
                 Effect::CopyText(text) => {
@@ -265,26 +264,77 @@ impl App {
                 }
                 Effect::Source { original, items } => source = Some((original, items)),
                 Effect::Guide(count) => steps = Some(count),
-                Effect::SaveClip(frames) => {
-                    let path = self
-                        .config
-                        .next_path(platform::local_time())
-                        .with_extension("gif");
-                    let written = encode_gif(&frames).and_then(|bytes| {
-                        if let Some(dir) = path.parent() {
-                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                Effect::StartClip(area) => {
+                    let whole = bruma_core::clip::Area::new(
+                        area.x as usize,
+                        area.y as usize,
+                        area.w as usize,
+                        area.h as usize,
+                    );
+                    let off = self.config.clip <= 0.0;
+                    let recorded = self
+                        .rewind
+                        .as_ref()
+                        .and_then(|r| r.clip(whole, scene.origin));
+                    if let Some(overlay) = self.overlay.as_mut() {
+                        match recorded.or_else(|| overlay.still_clip(area)) {
+                            Some(clip) => overlay.start_clip(clip),
+                            None if off => overlay.say("GIFs are off; turn them on in Settings"),
+                            None => overlay.say("Nothing recorded for a GIF yet"),
                         }
-                        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
-                    });
-                    message = Some(Message::Text(match written {
-                        Ok(()) => {
-                            println!("{}", path.display());
-                            run_after(&self.config.run_after, &path);
-                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                            format!("Saved clip {}", name.unwrap_or_default())
+                    }
+                }
+                Effect::MakeGif {
+                    area: _,
+                    from,
+                    to,
+                    items,
+                    save,
+                } => {
+                    if let Some(clip) = self.overlay.as_mut().and_then(Overlay::take_clip) {
+                        let path = self
+                            .config
+                            .next_path(platform::local_time())
+                            .with_extension("gif");
+                        let proxy = self.proxy.clone();
+                        let scale = scene.scale;
+                        self.gifs += 1;
+                        let spawned =
+                            std::thread::Builder::new()
+                                .name("bruma-gif".into())
+                                .spawn(move || {
+                                    let fonts = Fonts::system();
+                                    let written = clip
+                                        .gif(from, to, |picture| {
+                                            if items.is_empty() {
+                                                return picture;
+                                            }
+                                            let whole = picture.bounds();
+                                            bruma_core::export::flatten_scaled(
+                                                &picture, &items, whole, &fonts, scale,
+                                            )
+                                        })
+                                        .and_then(|bytes| {
+                                            if let Some(dir) = path.parent() {
+                                                std::fs::create_dir_all(dir).map_err(|e| {
+                                                    format!("{}: {e}", dir.display())
+                                                })?;
+                                            }
+                                            std::fs::write(&path, bytes)
+                                                .map_err(|e| format!("{}: {e}", path.display()))?;
+                                            Ok(path)
+                                        });
+                                    let _ = proxy.send_event(UserEvent::GifDone(
+                                        written,
+                                        save,
+                                        to - from,
+                                    ));
+                                });
+                        if spawned.is_err() {
+                            self.gifs -= 1;
                         }
-                        Err(e) => e,
-                    }));
+                        message = Some(Message::Text("Making the GIF".into()));
+                    }
                 }
                 Effect::Scroll(area) => {
                     message = Some(match scroll::capture(area, scene.origin) {
@@ -369,9 +419,9 @@ impl App {
         }
     }
 
-    /// The first time Bruma runs, says that it is running and which key takes
-    /// a capture. A program that starts into the tray otherwise looks as if
-    /// nothing had happened.
+    /// The first time Bruma runs: the intro, and after it a message saying
+    /// that Bruma is running and which key takes a capture. A program that
+    /// starts into the tray otherwise looks as if nothing had happened.
     fn welcome(&mut self, event_loop: &ActiveEventLoop) {
         let Some(marker) = history::dir().and_then(|dir| Some(dir.parent()?.join("welcomed")))
         else {
@@ -380,14 +430,37 @@ impl App {
         if marker.exists() {
             return;
         }
+        // Written first, so that something going wrong cannot repeat it.
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, b"");
         let monitor = event_loop
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
-        let (Ok(capture), Some(monitor)) = (platform::capture(), monitor) else {
-            return;
-        };
+        let opened = monitor
+            .ok_or_else(|| "no monitor".to_string())
+            .and_then(|m| Stage::intro(event_loop, m));
+        match opened {
+            Ok(stage) => {
+                self.pause_recording();
+                self.stage = Some(stage);
+            }
+            Err(e) => {
+                eprintln!("bruma: {e}");
+                self.hello(event_loop);
+            }
+        }
+    }
+
+    /// The message that follows the intro.
+    /// The screen now, on the monitor the pointer is on, for a message that
+    /// does not come from an overlay.
+    fn scene_now(&self, event_loop: &ActiveEventLoop) -> Option<Scene> {
+        let monitor = crate::stage::pointer_monitor(event_loop)?;
+        let capture = platform::capture().ok()?;
         let (at, size) = (monitor.position(), monitor.size());
-        let scene = Scene {
+        Some(Scene {
             origin: capture.origin,
             monitor: bruma_core::Rect::new(
                 (at.x - capture.origin.0) as f32,
@@ -398,16 +471,260 @@ impl App {
             scale: monitor.scale_factor() as f32,
             selection: None,
             screen: std::sync::Arc::new(capture.image),
+        })
+    }
+
+    fn hello(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(scene) = self.scene_now(event_loop) else {
+            return;
         };
-        let text = match self.tray.as_ref().and_then(|tray| tray.hotkey.as_deref()) {
+        let text = match self.tray.as_ref().and_then(Tray::hotkey) {
             Some(key) => format!("Bruma is running. Press {key} to take a screenshot."),
-            None => "Bruma is running. Its hotkey is taken; see the tray menu.".to_string(),
+            None => "Bruma is running. Its hotkey is taken; see Settings.".to_string(),
         };
         self.show_message(event_loop, &scene, Message::Hello(text));
-        if let Some(dir) = marker.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    }
+
+    fn pause_recording(&self) {
+        if let Some(rewind) = &self.rewind {
+            rewind.pause();
         }
-        let _ = std::fs::write(&marker, b"");
+    }
+
+    fn resume_recording(&self) {
+        if let Some(rewind) = &self.rewind {
+            rewind.resume();
+        }
+    }
+
+    /// What the settings panel shows, from the settings and the system.
+    fn settings_values(&self) -> bruma_core::settings::Values {
+        bruma_core::settings::Values {
+            hotkey: self.config.hotkey.clone(),
+            quick: self.config.quick,
+            snap: self.prefs.map_or(self.config.snap, |p| p.snap),
+            cursor: self.config.cursor,
+            rewind: self.config.rewind,
+            clip: self.config.clip,
+            preview: self.config.preview,
+            autosave: self.config.autosave,
+            folder: self.config.save_dir().display().to_string(),
+            history: self.config.history,
+            autostart: platform::autostart_enabled(),
+        }
+    }
+
+    fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
+        if self.overlay.is_some() || self.stage.is_some() {
+            return;
+        }
+        self.menu = None;
+        let Some(monitor) = crate::stage::pointer_monitor(event_loop) else {
+            return;
+        };
+        let values = self.settings_values();
+        match Stage::settings(event_loop, monitor, values, self.fonts.clone()) {
+            Ok(stage) => {
+                self.pause_recording();
+                self.stage = Some(stage);
+            }
+            Err(e) => eprintln!("bruma: {e}"),
+        }
+    }
+
+    fn close_stage(&mut self) {
+        if self.stage.take().is_some() {
+            // A hotkey being recorded gives its key back.
+            if let Some(tray) = &mut self.tray {
+                tray.resume();
+            }
+            self.resume_recording();
+        }
+    }
+
+    /// Answers what the settings panel asks for.
+    fn on_settings(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        effects: Vec<bruma_core::settings::Effect>,
+    ) {
+        use bruma_core::settings::Effect;
+        for effect in effects {
+            match effect {
+                Effect::Redraw => {}
+                Effect::Record(true) => {
+                    if let Some(tray) = &mut self.tray {
+                        tray.pause();
+                    }
+                }
+                Effect::Record(false) => {
+                    if let Some(tray) = &mut self.tray {
+                        tray.resume();
+                    }
+                }
+                Effect::Changed => self.apply_settings(),
+                Effect::PickFolder => {
+                    let owner = self.stage.as_ref().and_then(Stage::handle);
+                    if let Some(folder) = platform::pick_folder(owner, &self.config.save_dir()) {
+                        self.config.save_dir = folder.display().to_string();
+                        let saved = self.config.save().err();
+                        if let Some(form) = self.stage.as_mut().and_then(Stage::form) {
+                            form.values.folder = self.config.save_dir.clone();
+                            form.set_message(saved);
+                        }
+                    }
+                    if let Some(stage) = &self.stage {
+                        stage.redraw();
+                    }
+                }
+                Effect::EditFile => {
+                    self.close_stage();
+                    if let Err(e) = Config::open_in_editor() {
+                        eprintln!("bruma: {e}");
+                    }
+                }
+                Effect::OpenSource => {
+                    self.close_stage();
+                    let _ = std::process::Command::new("explorer").arg(SOURCE).spawn();
+                }
+                Effect::Close => self.close_stage(),
+            }
+        }
+        let _ = event_loop;
+    }
+
+    /// Takes what the settings panel shows, applies what changed, and
+    /// saves it. What cannot be applied goes back, with a word on why.
+    fn apply_settings(&mut self) {
+        let Some(values) = self
+            .stage
+            .as_mut()
+            .and_then(Stage::form)
+            .map(|f| f.values.clone())
+        else {
+            return;
+        };
+        let mut problem = None;
+        let mut values = values;
+
+        if values.hotkey != self.config.hotkey {
+            let result = match crate::stage::unsuitable(&values.hotkey) {
+                Some(why) => Err(why),
+                None => match &mut self.tray {
+                    Some(tray) => tray.set_hotkey(&values.hotkey),
+                    None => Err("there is no tray icon".to_string()),
+                },
+            };
+            match result {
+                Ok(()) => self.config.hotkey = values.hotkey.clone(),
+                Err(why) => {
+                    problem = Some(why);
+                    values.hotkey = self.config.hotkey.clone();
+                }
+            }
+        }
+        if values.autostart != platform::autostart_enabled() {
+            if let Err(why) = platform::set_autostart(values.autostart) {
+                problem = Some(why);
+                values.autostart = platform::autostart_enabled();
+            }
+        }
+        if values.cursor != self.config.cursor {
+            platform::set_capture_cursor(values.cursor);
+        }
+        let rewind_changed = values.rewind != self.config.rewind || values.clip != self.config.clip;
+        self.config.quick = values.quick;
+        self.config.clip = values.clip;
+        self.config.snap = values.snap;
+        if let Some(prefs) = &mut self.prefs {
+            prefs.snap = values.snap;
+        }
+        self.config.cursor = values.cursor;
+        self.config.rewind = values.rewind;
+        self.config.preview = values.preview;
+        self.config.autosave = values.autosave;
+        self.config.history = values.history;
+        if rewind_changed {
+            // A new recorder for the new length; paused, since the settings
+            // are on the screen.
+            self.rewind = None;
+            self.rewind = Rewind::start(
+                self.config.rewind,
+                self.config.rewind_fullscreen,
+                self.config.fast_capture,
+                self.config.clip,
+            );
+            self.pause_recording();
+        }
+        if let Err(why) = self.config.save() {
+            problem = Some(why);
+        }
+        if let Some(form) = self.stage.as_mut().and_then(Stage::form) {
+            form.values = values;
+            form.set_message(problem);
+        }
+        if let Some(stage) = &self.stage {
+            stage.redraw();
+        }
+    }
+
+    fn open_menu(&mut self, event_loop: &ActiveEventLoop, icon: (i32, i32, i32, i32)) {
+        if self.overlay.is_some() || self.stage.is_some() {
+            return;
+        }
+        self.menu = None;
+        let (hotkey, warning) = match &self.tray {
+            Some(tray) => (
+                tray.hotkey(),
+                tray.problem.as_ref().map(|_| {
+                    format!(
+                        "{} is taken; change it in Settings",
+                        crate::tray::pretty(&self.config.hotkey)
+                    )
+                }),
+            ),
+            None => (None, None),
+        };
+        match TrayMenu::open(event_loop, self.fonts.clone(), icon, hotkey, warning) {
+            Ok(menu) => self.menu = Some(menu),
+            Err(e) => eprintln!("bruma: {e}"),
+        }
+    }
+
+    fn on_menu(&mut self, event_loop: &ActiveEventLoop, entry: bruma_core::menu::Entry) {
+        use bruma_core::menu::Entry;
+        self.menu = None;
+        let later = |proxy: &EventLoopProxy<UserEvent>, wait: Duration| {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(wait);
+                let _ = proxy.send_event(UserEvent::Capture);
+            });
+        };
+        match entry {
+            // A moment for the menu to leave the screen before it is read.
+            Entry::Capture => later(&self.proxy, Duration::from_millis(120)),
+            Entry::Later => later(&self.proxy, Duration::from_secs(3)),
+            Entry::Folder => {
+                let dir = self.config.save_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+                    eprintln!("bruma: {e}");
+                }
+            }
+            Entry::History => {
+                if let Err(e) = history::open() {
+                    eprintln!("bruma: {e}");
+                }
+            }
+            Entry::Lab => {
+                if let Err(e) = lab::open() {
+                    eprintln!("bruma: {e}");
+                }
+            }
+            Entry::Settings => self.open_settings(event_loop),
+            Entry::Quit => event_loop.exit(),
+        }
     }
 
     fn pin(&mut self, event_loop: &ActiveEventLoop, image: Image, at: (i32, i32)) {
@@ -427,6 +744,11 @@ impl App {
             // A capture gets a card with a thumbnail; clicking it pins the
             // capture back where it was taken.
             Message::Shot(caption, image) if !preview.is_zero() => {
+                let caption = if self.again.is_some() {
+                    format!("{caption}  \u{00B7}  click to edit")
+                } else {
+                    caption
+                };
                 let (picture, rect) = bruma_core::render::preview_card(
                     &scene.screen,
                     &image,
@@ -456,7 +778,15 @@ impl App {
         if picture.width == 0 || picture.height == 0 {
             return;
         }
-        match Toast::show(event_loop, picture, desktop(rect.x, rect.y), lifetime, pin) {
+        let edit = pin.is_some() && self.again.is_some();
+        match Toast::show(
+            event_loop,
+            picture,
+            desktop(rect.x, rect.y),
+            lifetime,
+            pin,
+            edit,
+        ) {
             Ok(toast) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(toast.deadline()));
                 self.toast = Some(toast);
@@ -465,8 +795,37 @@ impl App {
         }
     }
 
+    /// Opens the capture just copied again, to draw on it.
+    fn edit_again(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(snapshot) = self.again.take() else {
+            return;
+        };
+        if self.overlay.is_some() || self.stage.is_some() {
+            return;
+        }
+        self.menu = None;
+        self.pause_recording();
+        let opened = Overlay::reopen(
+            event_loop,
+            self.fonts.clone(),
+            &self.config,
+            self.prefs,
+            self.shell.take(),
+            snapshot,
+        );
+        match opened {
+            Ok(overlay) => self.overlay = Some(overlay),
+            Err(e) => {
+                eprintln!("bruma: {e}");
+                self.resume_recording();
+            }
+        }
+    }
+
     fn exit_when_idle(&self, event_loop: &ActiveEventLoop) {
         if !self.background
+            && self.gifs == 0
+            && self.stage.is_none()
             && self.overlay.is_none()
             && self.pins.is_empty()
             && self.toast.is_none()
@@ -487,6 +846,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.config.rewind,
                 self.config.rewind_fullscreen,
                 self.config.fast_capture,
+                self.config.clip,
             );
             // Have the overlay's window ready before the first hotkey.
             let (origin, (width, height)) = platform::virtual_screen();
@@ -496,8 +856,11 @@ impl ApplicationHandler<UserEvent> for App {
             platform::listen_for_capture_requests(move || {
                 let _ = proxy.send_event(UserEvent::Capture);
             });
-            let autostart = platform::autostart_enabled();
-            match Tray::new(self.proxy.clone(), &self.config.hotkey, autostart) {
+            let proxy = self.proxy.clone();
+            platform::listen_for_settings_requests(move || {
+                let _ = proxy.send_event(UserEvent::Settings);
+            });
+            match Tray::new(self.proxy.clone(), &self.config.hotkey) {
                 Ok(tray) => {
                     self.tray = Some(tray);
                     self.welcome(event_loop);
@@ -530,52 +893,57 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Capture => self.open_overlay(event_loop),
-            UserEvent::Menu(id) => {
-                let Some(tray) = &self.tray else { return };
-                if id == tray.capture {
-                    self.open_overlay(event_loop);
-                } else if id == tray.folder {
-                    let dir = self.config.save_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
-                        eprintln!("bruma: {e}");
+            UserEvent::Capture => {
+                self.menu = None;
+                self.open_overlay(event_loop);
+            }
+            UserEvent::TrayMenu(icon) => self.open_menu(event_loop, icon),
+            UserEvent::Settings => self.open_settings(event_loop),
+            UserEvent::GifDone(written, save, ms) => {
+                self.gifs = self.gifs.saturating_sub(1);
+                let seconds = ms as f32 / 1000.0;
+                let text = match written {
+                    Ok(path) => {
+                        println!("{}", path.display());
+                        run_after(&self.config.run_after, &path);
+                        if save {
+                            format!("Saved a GIF, {seconds:.1} s")
+                        } else {
+                            match platform::copy_files(&[path]) {
+                                Ok(()) => format!("Copied a GIF, {seconds:.1} s"),
+                                Err(e) => e,
+                            }
+                        }
                     }
-                } else if id == tray.lab {
-                    if let Err(e) = lab::open() {
-                        eprintln!("bruma: {e}");
+                    Err(e) => e,
+                };
+                if self.overlay.is_none() {
+                    if let Some(scene) = self.scene_now(event_loop) {
+                        self.show_message(event_loop, &scene, Message::Text(text));
                     }
-                } else if id == tray.later {
-                    // Time to open a menu or hover something first.
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(3));
-                        let _ = proxy.send_event(UserEvent::Capture);
-                    });
-                } else if id == tray.history {
-                    if let Err(e) = history::open() {
-                        eprintln!("bruma: {e}");
-                    }
-                } else if id == tray.settings {
-                    if let Err(e) = Config::open_in_editor() {
-                        eprintln!("bruma: {e}");
-                    }
-                } else if id == *tray.autostart.id() {
-                    // The menu has already flipped the tick; make it true.
-                    let wanted = tray.autostart.is_checked();
-                    if let Err(e) = platform::set_autostart(wanted) {
-                        eprintln!("bruma: {e}");
-                        tray.autostart.set_checked(platform::autostart_enabled());
-                    }
-                } else if id == tray.quit {
-                    event_loop.exit();
                 }
+                self.exit_when_idle(event_loop);
             }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if let Some(overlay) = self.overlay.as_mut().filter(|o| o.id() == id) {
+        if let Some(stage) = self.stage.as_mut().filter(|s| s.id() == id) {
+            match stage.on_event(event) {
+                StageEvent::None => {}
+                StageEvent::Done => {
+                    self.close_stage();
+                    self.hello(event_loop);
+                }
+                StageEvent::Settings(effects) => self.on_settings(event_loop, effects),
+            }
+        } else if let Some(menu) = self.menu.as_mut().filter(|m| m.id() == id) {
+            match menu.on_event(event) {
+                MenuAction::None => {}
+                MenuAction::Close => self.menu = None,
+                MenuAction::Pick(entry) => self.on_menu(event_loop, entry),
+            }
+        } else if let Some(overlay) = self.overlay.as_mut().filter(|o| o.id() == id) {
             let effects = overlay.on_event(event);
             self.apply(event_loop, effects);
         } else if let Some(pin) = self.pins.get_mut(&id) {
@@ -588,7 +956,12 @@ impl ApplicationHandler<UserEvent> for App {
                 ToastAction::Close => self.toast = None,
                 ToastAction::Pin(request) => {
                     self.toast = None;
+                    self.again = None;
                     self.pin(event_loop, request.image, request.at);
+                }
+                ToastAction::Edit => {
+                    self.toast = None;
+                    self.edit_again(event_loop);
                 }
             }
         }
@@ -596,15 +969,36 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match &self.toast {
-            Some(toast) if Instant::now() >= toast.deadline() => {
-                self.toast = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
-                self.exit_when_idle(event_loop);
-            }
-            Some(toast) => event_loop.set_control_flow(ControlFlow::WaitUntil(toast.deadline())),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|t| Instant::now() >= t.deadline())
+        {
+            self.toast = None;
+            // The card is gone; so is the way back to the capture.
+            self.again = None;
+            self.exit_when_idle(event_loop);
         }
+        // A menu closes when something else comes to the front, even if the
+        // system never told it that it lost the keyboard.
+        if self.menu.as_ref().is_some_and(TrayMenu::lost) {
+            self.menu = None;
+        }
+        let wake = [
+            self.overlay.as_mut().and_then(Overlay::tick),
+            self.toast.as_ref().map(Toast::deadline),
+            self.stage.as_mut().and_then(Stage::tick),
+            self.menu
+                .as_ref()
+                .map(|_| Instant::now() + Duration::from_millis(150)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        event_loop.set_control_flow(match wake {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
@@ -624,6 +1018,10 @@ pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result
         pins: HashMap::new(),
         toast: None,
         tray: None,
+        stage: None,
+        menu: None,
+        again: None,
+        gifs: 0,
         rewind: None,
         prefs: None,
         editing,
@@ -640,30 +1038,6 @@ pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_clip_is_a_looping_gif_with_every_frame_and_its_timing() {
-        let frames: Vec<(Image, u32)> = [(200u8, 500u32), (120, 1000), (40, 1500)]
-            .into_iter()
-            .map(|(v, ms)| (Image::filled(32, 20, [v, v, v, 255]), ms))
-            .collect();
-        let bytes = encode_gif(&frames).unwrap();
-        assert_eq!(&bytes[..6], b"GIF89a");
-        let mut decoder = gif::DecodeOptions::new().read_info(&bytes[..]).unwrap();
-        assert_eq!((decoder.width(), decoder.height()), (32, 20));
-        let mut delays = Vec::new();
-        while let Some(frame) = decoder.read_next_frame().unwrap() {
-            delays.push(frame.delay);
-        }
-        assert_eq!(delays, [50, 100, 150], "hundredths of a second");
-    }
-
-    #[test]
-    fn a_clip_needs_frames_and_a_size_a_gif_can_hold() {
-        assert!(encode_gif(&[]).is_err());
-        let huge = Image::filled(70_000, 1, [0, 0, 0, 255]);
-        assert!(encode_gif(&[(huge, 100)]).is_err());
-    }
 
     #[test]
     fn a_guide_lists_one_line_per_step_beside_the_picture() {

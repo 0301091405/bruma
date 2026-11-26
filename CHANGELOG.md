@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.0 - 2026-11-26
+
+- Choosing an area copies it straight away. Click the preview card to open it
+  again and draw on it, or hold Shift as you let go to stay open. Picking a
+  tool before choosing also keeps it open. "Copy as soon as an area is
+  chosen" in Settings turns this off.
+- GIFs are recorded at thirty pictures a second, for up to ten seconds ("GIF
+  length" in Settings). Only what changes on screen is kept.
+- A GIF plays before it is saved: trim it with the bar under it, draw on it,
+  and the drawings go on every frame. It is copied as a file, so it pastes
+  into chats.
+- Snap finds the larger parts of a window too: the page of a browser, the body
+  of a site, the text of an editor. `Tab` steps out from the box under the
+  pointer to the part around it and then the window; `Shift+Tab` steps back.
+- The screen around a selection is no longer blurred, only a little darker.
+- The intro is lighter: only the crop marks and the dot.
+
+## 0.6.0 - 2026-11-26
+
+- Settings have their own panel: right-click the tray icon, then Settings, or
+  run `bruma settings`. Changes apply at once, the hotkey included.
+- The tray menu is Bruma's own, in the same style as the rest.
+- A short intro the first time Bruma starts.
+- Clicks on the tray icon are no longer sometimes ignored.
+- Uninstalling while Bruma is running now removes it completely.
+
 ## 0.5.3 - 2026-11-26
 
 First public release.

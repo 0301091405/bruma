@@ -27,6 +27,11 @@ pub struct Config {
     /// Seconds of screen history kept in memory for rewinding; 0 switches it
     /// off. Only the background process records.
     pub rewind: f32,
+    /// Seconds of screen kept for GIFs, at up to thirty pictures a second; 0
+    /// switches it off.
+    pub clip: f32,
+    /// Copy the moment an area is chosen, without stopping to draw.
+    pub quick: bool,
     /// Keep recording for rewind while a game or a film fills the screen.
     /// Off, so that a game never pays for a feature it is not using.
     pub rewind_fullscreen: bool,
@@ -55,6 +60,8 @@ impl Default for Config {
             autosave: false,
             preview: 4.0,
             rewind: 4.0,
+            clip: 10.0,
+            quick: true,
             rewind_fullscreen: false,
             fast_capture: true,
             cursor: false,
@@ -74,36 +81,119 @@ pub struct LocalTime {
     pub second: u32,
 }
 
-/// What a new settings file contains: every key, with its default.
-pub const TEMPLATE: &str = r#"# Bruma settings. Every line is optional: delete one to get its default back.
-# Changes take effect the next time Bruma starts (tray icon > Quit, then start it again).
-
-hotkey   = "PrintScreen"              # or e.g. "ctrl+shift+KeyS"
-save_dir = ""                         # empty = Pictures\bruma; "~" is your home folder
-filename = "bruma-%Y%m%d-%H%M%S.png"
-color    = 1                          # default ink, 1-6
-stroke   = 3                          # default stroke width
-snap     = true                       # snap selections to boxes and edges (G toggles it)
-autosave = false                      # also save a file whenever a capture is copied
-preview  = 4                          # seconds the preview card stays; 0 = a short message
-rewind   = 4                          # seconds of screen history; 0 turns rewind off
-rewind_fullscreen = false             # keep recording while a game or a film fills the screen
-fast_capture = true                   # read the screen the quick way where possible; false = always GDI
-cursor   = false                      # include the mouse cursor in captures
-history  = 200                        # captures kept in history; 0 turns history off
-run_after = ""                        # run after saving, e.g. 'curl -s -F "file=@{file}" https://example.com/upload'
-"#;
-
 impl Config {
-    /// Opens the settings file in Notepad, creating it from [`TEMPLATE`] first
-    /// if there is none.
+    /// The settings file for these values: every key, with a note on what it
+    /// does.
+    pub fn to_toml(&self) -> String {
+        let text = |v: &str| toml::Value::String(v.to_string()).to_string();
+        let number = |v: f32| {
+            if v.fract() == 0.0 {
+                format!("{}", v as i64)
+            } else {
+                format!("{v}")
+            }
+        };
+        let lines = [
+            ("hotkey", text(&self.hotkey), "or e.g. \"ctrl+shift+KeyS\""),
+            (
+                "save_dir",
+                text(&self.save_dir),
+                "empty = Pictures\\bruma; \"~\" is your home folder",
+            ),
+            (
+                "filename",
+                text(&self.filename),
+                "%Y %m %d %H %M %S are the date and time",
+            ),
+            ("color", self.color.to_string(), "default ink, 1-6"),
+            ("stroke", number(self.stroke), "default stroke width"),
+            (
+                "snap",
+                self.snap.to_string(),
+                "snap selections to boxes and edges (G toggles it)",
+            ),
+            (
+                "autosave",
+                self.autosave.to_string(),
+                "also save a file whenever a capture is copied",
+            ),
+            (
+                "preview",
+                number(self.preview),
+                "seconds the preview card stays; 0 = a short message",
+            ),
+            (
+                "rewind",
+                number(self.rewind),
+                "seconds of screen history; 0 turns rewind off",
+            ),
+            (
+                "clip",
+                number(self.clip),
+                "seconds kept for GIFs, 30 pictures a second; 0 turns it off",
+            ),
+            (
+                "quick",
+                self.quick.to_string(),
+                "copy as soon as an area is chosen; Shift keeps it open to draw",
+            ),
+            (
+                "rewind_fullscreen",
+                self.rewind_fullscreen.to_string(),
+                "keep recording while a game or a film fills the screen",
+            ),
+            (
+                "fast_capture",
+                self.fast_capture.to_string(),
+                "read the screen the quick way where possible; false = always GDI",
+            ),
+            (
+                "cursor",
+                self.cursor.to_string(),
+                "include the mouse cursor in captures",
+            ),
+            (
+                "history",
+                self.history.to_string(),
+                "captures kept in history; 0 turns history off",
+            ),
+            (
+                "run_after",
+                text(&self.run_after),
+                "run after saving, e.g. 'curl -s -F \"file=@{file}\" https://example.com/upload'",
+            ),
+        ];
+        let mut out = String::from(
+            "# Bruma settings. Every line is optional: delete one to get its default back.\n\
+             # Settings in the tray menu change most of these at once; changes made\n\
+             # here take effect the next time Bruma starts.\n\n",
+        );
+        for (key, value, note) in lines {
+            out.push_str(&format!("{key:<9} = {value:<27} # {note}\n"));
+        }
+        out
+    }
+
+    /// Writes these values to the settings file.
+    pub fn save(&self) -> Result<PathBuf, String> {
+        let path = Self::path().ok_or("no settings folder on this system")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, self.to_toml()).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Opens the settings file in Notepad, creating it with the defaults
+    /// first if there is none.
     pub fn open_in_editor() -> Result<PathBuf, String> {
         let path = Self::path().ok_or("no settings folder on this system")?;
         if !path.exists() {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             }
-            std::fs::write(&path, TEMPLATE).map_err(|e| format!("{}: {e}", path.display()))?;
+            std::fs::write(&path, Self::default().to_toml())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         std::process::Command::new("notepad")
             .arg(&path)
@@ -232,8 +322,23 @@ mod tests {
     };
 
     #[test]
-    fn the_template_is_valid_and_spells_out_the_defaults() {
-        assert_eq!(Config::parse(TEMPLATE).unwrap(), Config::default());
+    fn a_written_file_reads_back_the_same() {
+        assert_eq!(
+            Config::parse(&Config::default().to_toml()).unwrap(),
+            Config::default()
+        );
+        let odd = Config {
+            hotkey: "ctrl+shift+KeyS".into(),
+            save_dir: r#"C:\Users\someone\Pictures\shots "new""#.into(),
+            filename: "shot-%H%M.png".into(),
+            stroke: 2.5,
+            preview: 0.0,
+            rewind: 30.0,
+            history: 0,
+            run_after: r#"curl -s -F "file=@{file}" https://example.com"#.into(),
+            ..Config::default()
+        };
+        assert_eq!(Config::parse(&odd.to_toml()).unwrap(), odd);
     }
 
     #[test]

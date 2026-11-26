@@ -5,13 +5,17 @@
 //! picture: nothing at all when nothing changed, a few milliseconds when
 //! something did.
 //!
+//! It also says which parts of the screen changed, so only those are copied;
+//! the recorder keeps only those for GIFs.
+//!
 //! It is fussier, though. Anything that is not the plain case (a rotated
 //! monitor, a picture of another size than its monitor, an output that will
 //! not be duplicated) makes [`Duplicator::new`] decline, and any error later
 //! makes [`Duplicator::refresh`] give up; the caller then reads the screen
 //! with GDI, as before.
 
-use windows::Win32::Foundation::HMODULE;
+use bruma_core::clip::Area;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
@@ -23,8 +27,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIFactory1,
-    IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
+    IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS};
 use windows::core::Interface;
@@ -55,6 +59,9 @@ pub struct Duplicator {
     size: (i32, i32),
     /// Blue, green, red and an unused byte for every pixel, top row first.
     pixels: Vec<u8>,
+    /// What changed in the last [`Duplicator::refresh`], in the picture's
+    /// coordinates.
+    dirty: Vec<Area>,
 }
 
 impl Duplicator {
@@ -164,6 +171,7 @@ impl Duplicator {
             origin,
             size,
             pixels: vec![0u8; size.0 as usize * size.1 as usize * 4],
+            dirty: Vec::new(),
         })
     }
 
@@ -177,6 +185,7 @@ impl Duplicator {
         }
         let stride = self.size.0 as usize * 4;
         let mut changed = false;
+        self.dirty.clear();
         for output in &mut self.outputs {
             let wait = if output.seen { 0 } else { FIRST_PICTURE_MS };
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -195,9 +204,19 @@ impl Duplicator {
                 let copied = if info.LastPresentTime == 0 && output.seen {
                     Ok(false)
                 } else {
-                    output
-                        .copy(resource, &mut self.pixels, stride)
-                        .map(|()| true)
+                    let areas = if output.seen {
+                        output.changed(&info)
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| vec![Area::new(0, 0, output.size.0, output.size.1)]);
+                    let copied = output.copy(resource, &mut self.pixels, stride, &areas);
+                    self.dirty.extend(
+                        areas
+                            .iter()
+                            .map(|a| Area::new(a.x + output.at.0, a.y + output.at.1, a.w, a.h)),
+                    );
+                    copied.map(|()| true)
                 };
                 let _ = output.duplication.ReleaseFrame();
                 changed |= copied?;
@@ -205,6 +224,11 @@ impl Duplicator {
             output.seen = true;
         }
         Ok(changed)
+    }
+
+    /// What changed in the last [`Duplicator::refresh`].
+    pub fn dirty(&self) -> &[Area] {
+        &self.dirty
     }
 
     /// The desktop as of the last [`Duplicator::refresh`].
@@ -219,13 +243,61 @@ impl Duplicator {
 }
 
 impl Output {
-    /// Copies the monitor's new picture into its place in `pixels`, the
-    /// picture of the whole desktop, whose rows are `stride` bytes long.
+    /// The parts of the monitor that changed in the frame just acquired:
+    /// what was drawn, and where things were moved to. `None` when the
+    /// system does not say.
+    unsafe fn changed(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<Vec<Area>> {
+        let size = info.TotalMetadataBufferSize as usize;
+        if size == 0 {
+            return None;
+        }
+        let bounds = Area::new(0, 0, self.size.0, self.size.1);
+        let area = |r: &RECT| {
+            let (x0, y0) = (r.left.max(0) as usize, r.top.max(0) as usize);
+            let (x1, y1) = (r.right.max(0) as usize, r.bottom.max(0) as usize);
+            (x1 > x0 && y1 > y0)
+                .then(|| Area::new(x0, y0, x1 - x0, y1 - y0))
+                .and_then(|a| a.intersect(&bounds))
+        };
+        let mut out = Vec::new();
+        unsafe {
+            let count = size / size_of::<DXGI_OUTDUPL_MOVE_RECT>() + 1;
+            let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); count];
+            let mut used = 0u32;
+            self.duplication
+                .GetFrameMoveRects(
+                    (moves.len() * size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
+                    moves.as_mut_ptr(),
+                    &mut used,
+                )
+                .ok()?;
+            let n = used as usize / size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+            out.extend(moves[..n].iter().filter_map(|m| area(&m.DestinationRect)));
+            let count = size / size_of::<RECT>() + 1;
+            let mut rects = vec![RECT::default(); count];
+            let mut used = 0u32;
+            self.duplication
+                .GetFrameDirtyRects(
+                    (rects.len() * size_of::<RECT>()) as u32,
+                    rects.as_mut_ptr(),
+                    &mut used,
+                )
+                .ok()?;
+            let n = used as usize / size_of::<RECT>();
+            out.extend(rects[..n].iter().filter_map(area));
+        }
+        Some(out)
+    }
+
+    /// Copies the parts `areas` (in the monitor's coordinates) of the
+    /// monitor's new picture into their place in `pixels`, the picture of the
+    /// whole desktop, whose rows are `stride` bytes long.
     unsafe fn copy(
         &self,
         resource: Option<IDXGIResource>,
         pixels: &mut [u8],
         stride: usize,
+        areas: &[Area],
     ) -> Result<(), ()> {
         unsafe {
             let texture: ID3D11Texture2D = resource.ok_or(())?.cast().map_err(|_| ())?;
@@ -242,9 +314,13 @@ impl Output {
             }
             let source =
                 std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (h - 1) + w * 4);
-            for (y, row) in source.chunks(pitch).enumerate() {
-                let start = (self.at.1 + y) * stride + self.at.0 * 4;
-                pixels[start..start + w * 4].copy_from_slice(&row[..w * 4]);
+            for a in areas {
+                for y in a.y..(a.y + a.h).min(h) {
+                    let from = y * pitch + a.x * 4;
+                    let to = (self.at.1 + y) * stride + (self.at.0 + a.x) * 4;
+                    let len = a.w.min(w - a.x) * 4;
+                    pixels[to..to + len].copy_from_slice(&source[from..from + len]);
+                }
             }
             self.context.Unmap(&self.staging, 0);
             Ok(())

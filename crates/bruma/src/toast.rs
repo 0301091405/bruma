@@ -34,6 +34,8 @@ pub enum ToastAction {
     None,
     Close,
     Pin(PinRequest),
+    /// Open the capture again to draw on it.
+    Edit,
 }
 
 pub struct Toast {
@@ -42,8 +44,10 @@ pub struct Toast {
     _context: Context<Rc<Window>>,
     picture: Pixmap,
     deadline: Instant,
-    /// Present on a preview card: clicking it pins the capture.
+    /// Present on a preview card: a right click pins the capture.
     pin: Option<PinRequest>,
+    /// A left click opens the capture again to draw on it.
+    edit: bool,
 }
 
 impl Toast {
@@ -54,6 +58,7 @@ impl Toast {
         at: (i32, i32),
         lifetime: Duration,
         pin: Option<PinRequest>,
+        edit: bool,
     ) -> Result<Self, String> {
         let size = PhysicalSize::new(image.width, image.height);
         let picture = IntSize::from_wh(image.width, image.height)
@@ -82,6 +87,7 @@ impl Toast {
             picture,
             deadline: Instant::now() + lifetime,
             pin,
+            edit,
         };
         toast.draw();
         Ok(toast)
@@ -112,8 +118,8 @@ impl Toast {
         }
     }
 
-    /// A left click pins the capture a preview card shows; any other click
-    /// just dismisses the message.
+    /// On a preview card a left click opens the capture again to draw on,
+    /// and a right click pins it. Any other click just dismisses the message.
     pub fn on_event(&mut self, event: WindowEvent) -> ToastAction {
         match event {
             WindowEvent::RedrawRequested => self.draw(),
@@ -122,10 +128,22 @@ impl Toast {
                 button: MouseButton::Left,
                 ..
             } => {
+                if self.edit {
+                    return ToastAction::Edit;
+                }
                 return match self.pin.take() {
                     Some(request) => ToastAction::Pin(request),
                     None => ToastAction::Close,
                 };
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.pin.is_some() => {
+                if let Some(request) = self.pin.take() {
+                    return ToastAction::Pin(request);
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,

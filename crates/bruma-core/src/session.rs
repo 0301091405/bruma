@@ -84,6 +84,9 @@ pub enum Key {
     Down,
     PageUp,
     PageDown,
+    /// Before choosing: the next larger area around the pointer (with Shift,
+    /// the next smaller).
+    Tab,
     /// F1: show or hide the list of keys.
     Help,
     /// A character key, lower-cased, independent of modifiers.
@@ -116,6 +119,8 @@ pub enum Input {
     /// A double click: edits the text under it, or copies the selection.
     /// Answers with nothing when it means nothing here.
     DoubleClick(Point),
+    /// Time has passed, in milliseconds: a GIF being made plays on.
+    Tick(u32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,8 +136,20 @@ pub enum Effect {
     /// Recognise the words in this image, whose top-left corner is at the
     /// given screen position, and answer with [`Input::Words`].
     FindWords(Image, Point),
-    /// Save these frames, each shown for the given milliseconds, as a clip.
-    SaveClip(Vec<(Image, u32)>),
+    /// Make a GIF of this area of the screen: the application fetches the
+    /// recording and answers with [`Session::enter_clip`], or with
+    /// [`Session::say`] when there is none.
+    StartClip(Rect),
+    /// Write the GIF: the part of the recording from `from` to `to`
+    /// (milliseconds into it) of `area`, with `items` drawn on every frame
+    /// (in the area's own coordinates). Copied, or with `save` only saved.
+    MakeGif {
+        area: Rect,
+        from: u64,
+        to: u64,
+        items: Vec<Annotation>,
+        save: bool,
+    },
     /// The capture about to be saved has this many numbered steps.
     Guide(u32),
     /// The capture about to be saved, before anything was drawn on it, and
@@ -178,6 +195,8 @@ pub struct Options {
     pub framed: bool,
     /// The region selected last time, for selecting it again.
     pub last: Option<Rect>,
+    /// Copy the moment an area is chosen, without stopping to draw.
+    pub quick: bool,
 }
 
 impl Default for Options {
@@ -189,7 +208,73 @@ impl Default for Options {
             snap: true,
             framed: false,
             last: None,
+            quick: false,
         }
+    }
+}
+
+/// What was asked for before an area was chosen, to happen once it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pending {
+    None,
+    /// Stay open to draw, with this tool.
+    Edit(Option<Tool>),
+    /// Make a GIF of it.
+    Clip,
+}
+
+/// A GIF in the making: the recording of the selection, playing, and the
+/// part of it that will be kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipView {
+    /// How long the recording is, in milliseconds.
+    pub length: u64,
+    /// The part kept, in milliseconds into the recording.
+    pub from: u64,
+    pub to: u64,
+    /// The moment shown.
+    pub at: u64,
+    pub playing: bool,
+    /// Pictures a second, at most.
+    pub rate: u32,
+}
+
+/// The shortest GIF that can be cut, in milliseconds.
+const SHORTEST_CLIP: u64 = 200;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ClipGrab {
+    From,
+    To,
+    At,
+}
+
+/// Where the bar of a GIF in the making is, and its parts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipBar {
+    pub rect: Rect,
+    /// The play and pause button.
+    pub play: Rect,
+    /// The line the recording is laid out along.
+    pub track: Rect,
+    length: u64,
+}
+
+impl ClipBar {
+    /// Where on the track a moment is.
+    pub fn x_of(&self, t: u64) -> f32 {
+        let k = if self.length == 0 {
+            0.0
+        } else {
+            t as f32 / self.length as f32
+        };
+        self.track.x + self.track.w * k.clamp(0.0, 1.0)
+    }
+
+    /// The moment at a place on the track.
+    pub fn t_of(&self, x: f32) -> u64 {
+        let k = ((x - self.track.x) / self.track.w.max(1.0)).clamp(0.0, 1.0);
+        (k * self.length as f32).round() as u64
     }
 }
 
@@ -298,6 +383,27 @@ pub struct Session {
     strip_hover: Option<StripItem>,
     framed: bool,
     last: Option<Rect>,
+    /// Copy as soon as an area is chosen; off once anything else is asked for.
+    quick: bool,
+    pending: Pending,
+    clip: Option<ClipView>,
+    clip_frame: Option<Arc<Image>>,
+    clip_grab: Option<ClipGrab>,
+    /// Parts of windows that the system knows about (a browser's page, an
+    /// editor's text, a panel), each with the window it belongs to.
+    panes: Vec<(Rect, Rect)>,
+    /// How many steps larger than the smallest area under the pointer the
+    /// one offered is, and the smallest area it is counted from.
+    level: usize,
+    level_base: Option<Rect>,
+}
+
+/// Whether two areas are the same to the eye: every edge within a few pixels.
+fn alike(a: &Rect, b: &Rect) -> bool {
+    (a.x - b.x).abs() <= 6.0
+        && (a.y - b.y).abs() <= 6.0
+        && (a.right() - b.right()).abs() <= 6.0
+        && (a.bottom() - b.bottom()).abs() <= 6.0
 }
 
 impl Session {
@@ -349,6 +455,81 @@ impl Session {
             strip_hover: None,
             framed: options.framed,
             last: options.last,
+            quick: options.quick,
+            pending: Pending::None,
+            clip: None,
+            clip_frame: None,
+            clip_grab: None,
+            panes: Vec::new(),
+            level: 0,
+            level_base: None,
+        }
+    }
+
+    /// The parts of windows the system knows about, each with its window, in
+    /// screen-image coordinates.
+    pub fn set_panes(&mut self, panes: Vec<(Rect, Rect)>) {
+        let bounds = self.screen().bounds();
+        self.panes = panes
+            .into_iter()
+            .map(|(owner, pane)| {
+                (
+                    owner.round().intersect(&bounds),
+                    pane.round().intersect(&bounds),
+                )
+            })
+            .filter(|(owner, pane)| !owner.is_empty() && pane.w >= 40.0 && pane.h >= 40.0)
+            .collect();
+    }
+
+    /// The top-level window under the pointer, front-most first.
+    fn window_under(&self, p: Point) -> Option<Rect> {
+        self.windows.iter().copied().find(|w| w.contains(p))
+    }
+
+    /// Everything a click could select while nothing is selected yet, from
+    /// the smallest to the window: the box under the pointer, the parts of
+    /// the window around it, the window.
+    fn targets(&self) -> Vec<Rect> {
+        if self.selection.is_some() {
+            return Vec::new();
+        }
+        let p = self.pointer;
+        let window = self.window_under(p);
+        let mut found: Vec<Rect> = Vec::new();
+        if let Hover::Flat(rect, _) | Hover::Busy(rect) = self.hover {
+            found.push(rect);
+        }
+        if let Some(w) = window {
+            found.extend(
+                self.panes
+                    .iter()
+                    .filter(|(owner, pane)| alike(owner, &w) && pane.contains(p))
+                    .map(|(_, pane)| *pane),
+            );
+        }
+        found.sort_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)));
+        let mut out: Vec<Rect> = Vec::new();
+        for rect in found {
+            // Something with the edges of the window is the window, which
+            // comes last; the page of a full-screen browser is not.
+            let whole = window.is_some_and(|w| alike(&rect, &w));
+            if whole || out.iter().any(|r| alike(r, &rect)) {
+                continue;
+            }
+            out.push(rect);
+        }
+        out.extend(window);
+        out
+    }
+
+    /// Forgets the chosen size when the smallest area under the pointer is
+    /// another one.
+    fn settle_level(&mut self) {
+        let base = self.targets().first().copied();
+        if base != self.level_base {
+            self.level_base = base;
+            self.level = 0;
         }
     }
 
@@ -402,6 +583,61 @@ impl Session {
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
+    /// The frame being looked at, to keep.
+    pub fn current(&self) -> Arc<Image> {
+        self.frames[self.frame].image.clone()
+    }
+    /// Every frame, oldest first.
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+    pub fn windows(&self) -> &[Rect] {
+        &self.windows
+    }
+    pub fn monitors(&self) -> &[Rect] {
+        &self.monitors
+    }
+    /// Whether choosing an area copies it straight away.
+    pub fn quick(&self) -> bool {
+        self.quick
+    }
+    /// The GIF in the making, if one is.
+    pub fn clip(&self) -> Option<&ClipView> {
+        self.clip.as_ref()
+    }
+    /// The picture of the selection at the moment the GIF shows.
+    pub fn clip_frame(&self) -> Option<&Image> {
+        self.clip_frame.as_deref()
+    }
+    /// The bar under a GIF in the making: where to play, pause and trim it.
+    pub fn clip_bar(&self) -> Option<ClipBar> {
+        let view = self.clip.as_ref()?;
+        let sel = self.selection?;
+        let monitor = self.monitor_of(sel.center());
+        let px = |v: f32| (v * self.scale).round();
+        let w = px(540.0).min(monitor.w - px(32.0));
+        let h = px(44.0);
+        let rect = Rect::new(
+            (monitor.x + (monitor.w - w) / 2.0).round(),
+            monitor.bottom() - h - px(24.0),
+            w,
+            h,
+        );
+        let play = Rect::new(rect.x + px(8.0), rect.y + px(6.0), px(32.0), px(32.0));
+        let track = Rect::new(
+            play.right() + px(14.0),
+            rect.y + px(12.0),
+            rect.right() - px(118.0) - (play.right() + px(14.0)),
+            px(20.0),
+        );
+        Some(ClipBar {
+            rect,
+            play,
+            track,
+            length: view.length,
+        })
+    }
+
     /// The newest frame: the screen as it is now.
     pub fn present(&self) -> Arc<Image> {
         self.frames[self.frames.len() - 1].image.clone()
@@ -418,23 +654,54 @@ impl Session {
     /// What a click would select while nothing is selected yet: the box,
     /// button, picture or circle under the pointer, or failing that the window.
     pub fn hover_target(&self) -> Option<Rect> {
-        if self.selection.is_some() {
-            return None;
-        }
-        let window = self
-            .windows
-            .iter()
+        let targets = self.targets();
+        targets
+            .get(self.level.min(targets.len().saturating_sub(1)))
             .copied()
-            .find(|w| w.contains(self.pointer));
-        let element = match self.hover {
-            Hover::Flat(rect, _) | Hover::Busy(rect) => Some(rect),
-            Hover::Unknown | Hover::Miss(_) => None,
-        };
-        match (element, window) {
-            // Something that fills its window is the window.
-            (Some(e), Some(w)) if e.w * e.h > 0.85 * w.w * w.h => Some(w),
-            (Some(e), _) => Some(e),
-            (None, w) => w,
+    }
+
+    /// A short message for the person, shown until their next action.
+    pub fn say(&mut self, text: &str) {
+        self.notice = Some(text.to_string());
+    }
+
+    /// Chooses `area`, as if it had been dragged, and stays open to draw: a
+    /// capture opened again to be edited.
+    pub fn select(&mut self, area: Rect) {
+        let area = area.round().intersect(&self.screen().bounds());
+        if !area.is_empty() {
+            self.selection = Some(area);
+            self.drag = Drag::None;
+            self.quick = false;
+            self.pending = Pending::None;
+        }
+    }
+
+    /// Starts making a GIF of the selection from a recording `length`
+    /// milliseconds long with at most `rate` pictures a second.
+    pub fn enter_clip(&mut self, length: u64, rate: u32) {
+        self.quick = false;
+        self.clip = Some(ClipView {
+            length,
+            from: 0,
+            to: length,
+            at: 0,
+            playing: true,
+            rate,
+        });
+        self.clip_frame = None;
+        self.clip_grab = None;
+    }
+
+    /// The moment of the recording to show now, while a GIF is being made.
+    pub fn clip_time(&self) -> Option<u64> {
+        self.clip.as_ref().map(|c| c.at)
+    }
+
+    /// The picture of the selection at [`Session::clip_time`].
+    pub fn show_clip_frame(&mut self, picture: Arc<Image>) {
+        if self.clip.is_some() {
+            self.clip_frame = Some(picture);
         }
     }
 
@@ -497,7 +764,8 @@ impl Session {
         if keep {
             return;
         }
-        self.hover = match snap::flat_region(self.screen(), p) {
+        let window = self.window_under(p);
+        self.hover = match snap::flat_region(self.screen(), p, window) {
             Some(rect) => Hover::Flat(rect, colour),
             None => match self.hover {
                 // Still inside the same picture: no need to box it again.
@@ -655,14 +923,133 @@ impl Session {
                     fx.push(Effect::Redraw);
                 }
             }
+            Input::Tick(ms) => {
+                if let Some(view) = &mut self.clip {
+                    if view.playing && self.clip_grab.is_none() {
+                        let span = view.to.saturating_sub(view.from).max(1);
+                        view.at =
+                            view.from + (view.at.saturating_sub(view.from) + ms as u64) % span;
+                        fx.push(Effect::Redraw);
+                    }
+                }
+            }
         }
         fx
+    }
+
+    /// An area has just been chosen: copy it, or do what was asked before.
+    fn chosen(&mut self, fx: &mut Vec<Effect>) {
+        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        match std::mem::replace(&mut self.pending, Pending::None) {
+            Pending::Clip => {
+                self.quick = false;
+                self.notice = None;
+                fx.push(Effect::StartClip(
+                    sel.round().intersect(&self.screen().bounds()),
+                ));
+            }
+            Pending::Edit(tool) => {
+                self.quick = false;
+                self.notice = None;
+                if let Some(tool) = tool {
+                    self.set_tool(tool);
+                }
+            }
+            Pending::None if self.quick && !self.mods.shift => self.finish(Output::Copy, fx),
+            Pending::None => self.quick = false,
+        }
+    }
+
+    /// A press on the bar of a GIF in the making. `true` if it was on it.
+    fn clip_press(&mut self, p: Point) -> bool {
+        let (Some(bar), Some(view)) = (self.clip_bar(), self.clip.as_mut()) else {
+            return false;
+        };
+        if !bar.rect.contains(p) {
+            return false;
+        }
+        if bar.play.inflate(4.0 * self.scale).contains(p) {
+            view.playing = !view.playing;
+            return true;
+        }
+        let near = 10.0 * self.scale;
+        let (from_x, to_x) = (bar.x_of(view.from), bar.x_of(view.to));
+        self.clip_grab = Some(if (p.x - to_x).abs() <= near {
+            ClipGrab::To
+        } else if (p.x - from_x).abs() <= near {
+            ClipGrab::From
+        } else {
+            ClipGrab::At
+        });
+        self.clip_drag(p);
+        true
+    }
+
+    /// Moves what is held on the bar to the pointer.
+    fn clip_drag(&mut self, p: Point) {
+        let (Some(bar), Some(grab)) = (self.clip_bar(), self.clip_grab) else {
+            return;
+        };
+        let Some(view) = self.clip.as_mut() else {
+            return;
+        };
+        let t = bar.t_of(p.x);
+        let shortest = SHORTEST_CLIP.min(view.length);
+        match grab {
+            ClipGrab::From => {
+                view.from = t.min(view.to.saturating_sub(shortest));
+                view.at = view.from;
+            }
+            ClipGrab::To => {
+                view.to = t.max(view.from + shortest).min(view.length);
+                view.at = view.to;
+            }
+            ClipGrab::At => {
+                view.at = t.clamp(view.from, view.to);
+                view.playing = false;
+            }
+        }
+    }
+
+    /// The GIF as it stands, written.
+    fn make_gif(&mut self, save: bool, fx: &mut Vec<Effect>) {
+        self.commit_text();
+        let (Some(view), Some(sel)) = (self.clip.as_ref(), self.selection) else {
+            return;
+        };
+        let area = sel.round().intersect(&self.screen().bounds());
+        if area.is_empty() {
+            return;
+        }
+        let items = self
+            .doc
+            .items()
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                item.translate(-area.x, -area.y);
+                item
+            })
+            .collect();
+        fx.push(Effect::MakeGif {
+            area,
+            from: view.from,
+            to: view.to,
+            items,
+            save,
+        });
+        fx.push(Effect::Close);
     }
 
     fn pointer_down(&mut self, p: Point, fx: &mut Vec<Effect>) {
         self.pointer = p;
         fx.push(Effect::Redraw);
         self.commit_text();
+        if self.clip_press(p) {
+            return;
+        }
 
         let Some(sel) = self.selection else {
             self.drag = Drag::Select {
@@ -681,6 +1068,17 @@ impl Session {
             }
         }
         match self.tool {
+            // While a GIF is being made the area stays where it is: only the
+            // drawings move.
+            Tool::Select if self.clip.is_some() => {
+                if let Some(index) = self.doc.hit(p, self.hit_tolerance()) {
+                    self.selected = Some(index);
+                    self.doc.begin_gesture();
+                    self.drag = Drag::MoveItem { index, last: p };
+                } else {
+                    self.selected = None;
+                }
+            }
             Tool::Select => {
                 if let Some(handle) = self.handle_at(p, sel) {
                     self.selected = None;
@@ -743,11 +1141,17 @@ impl Session {
 
     fn pointer_move(&mut self, p: Point, fx: &mut Vec<Effect>) {
         self.pointer = p;
+        if self.clip_grab.is_some() {
+            self.clip_drag(p);
+            fx.push(Effect::Redraw);
+            return;
+        }
         let bounds = self.screen().bounds();
         match self.drag {
             Drag::None => {
                 if self.selecting() {
                     self.update_hover();
+                    self.settle_level();
                     fx.push(Effect::Redraw);
                 } else {
                     // Over the strip: remember which item, for its tooltip.
@@ -863,6 +1267,17 @@ impl Session {
     }
 
     fn pointer_up(&mut self, p: Point, fx: &mut Vec<Effect>) {
+        if let Some(grab) = self.clip_grab.take() {
+            if let Some(view) = &mut self.clip {
+                if grab != ClipGrab::At {
+                    // Trimmed: play the part that is left from its start.
+                    view.at = view.from;
+                    view.playing = true;
+                }
+            }
+            fx.push(Effect::Redraw);
+            return;
+        }
         if self.drag == Drag::None {
             return;
         }
@@ -871,11 +1286,14 @@ impl Session {
             Drag::Select { active: false, .. } => {
                 if self.selection.is_none() {
                     self.selection = self.hover_target();
+                    self.chosen(fx);
                 }
             }
             Drag::Select { active: true, .. } => {
                 if self.selection.is_some_and(|s| s.w < 1.0 || s.h < 1.0) {
                     self.selection = None;
+                } else {
+                    self.chosen(fx);
                 }
             }
             Drag::Draw { anchor } => {
@@ -918,7 +1336,37 @@ impl Session {
             return;
         }
 
+        // A GIF in the making: the area stays, and space plays or pauses.
+        if self.clip.is_some() {
+            match key {
+                Key::Char(' ') => {
+                    if let Some(view) = &mut self.clip {
+                        view.playing = !view.playing;
+                    }
+                    fx.push(Effect::Redraw);
+                    return;
+                }
+                Key::Char(
+                    'f' | 's' | 'z' | 'w' | 'k' | 'j' | 'p' | 'y' | 'x' | 'm' | 'u' | ',' | '.',
+                ) if !mods.ctrl => {
+                    return;
+                }
+                Key::Left | Key::Right | Key::Up | Key::Down if self.selected.is_none() => return,
+                Key::PageUp | Key::PageDown => return,
+                _ => {}
+            }
+        }
         match key {
+            Key::Tab if self.selecting() && self.drag == Drag::None => {
+                self.settle_level();
+                let count = self.targets().len();
+                self.level = if mods.shift {
+                    self.level.saturating_sub(1)
+                } else {
+                    (self.level + 1).min(count.saturating_sub(1))
+                };
+            }
+            Key::Tab => return,
             Key::Escape => return self.escape(fx),
             Key::Enter => return self.finish(Output::Copy, fx),
             Key::Delete | Key::Backspace => {
@@ -952,8 +1400,15 @@ impl Session {
             Key::Char(c) => match c {
                 'p' => return self.finish(Output::Pin, fx),
                 'f' => {
+                    let fresh = self.selection.is_none();
                     self.selection = Some(self.monitor_of(self.pointer));
                     self.drag = Drag::None;
+                    if fresh {
+                        self.chosen(fx);
+                        if fx.contains(&Effect::Close) {
+                            return;
+                        }
+                    }
                 }
                 's' => {
                     if let Some(sel) = self.selection {
@@ -992,8 +1447,14 @@ impl Session {
                     self.rewind(1);
                 }
                 'w' => {
+                    let fresh = self.selection.is_none();
                     if !self.select_change() {
                         self.notice = Some("nothing changed".into());
+                    } else if fresh {
+                        self.chosen(fx);
+                        if fx.contains(&Effect::Close) {
+                            return;
+                        }
                     }
                 }
                 'x' | 'm' => {
@@ -1031,11 +1492,26 @@ impl Session {
                         Some(rect) => {
                             self.selection = Some(rect);
                             self.drag = Drag::None;
+                            self.chosen(fx);
+                            if fx.contains(&Effect::Close) {
+                                return;
+                            }
                         }
                         None => self.notice = Some("no earlier region".into()),
                     }
                 }
-                'k' => return self.clip(fx),
+                'k' => match self.selection.filter(|s| !s.is_empty()) {
+                    Some(sel) => {
+                        self.commit_text();
+                        fx.push(Effect::StartClip(
+                            sel.round().intersect(&self.screen().bounds()),
+                        ));
+                    }
+                    None => {
+                        self.pending = Pending::Clip;
+                        self.notice = Some("Choose the area for the GIF".into());
+                    }
+                },
                 'j' => return self.before_after(fx),
                 'y' => {
                     let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
@@ -1054,6 +1530,12 @@ impl Session {
                 ']' => self.set_stroke(self.stroke + 1.0),
                 _ => match Tool::from_key(c) {
                     Some(tool) if self.selection.is_some() => self.set_tool(tool),
+                    // A tool picked before choosing an area: stay open to
+                    // draw once it is chosen.
+                    Some(tool) if self.quick => {
+                        self.pending = Pending::Edit(Some(tool));
+                        self.notice = Some("Choose the area to draw on".to_string());
+                    }
                     _ => return,
                 },
             },
@@ -1079,6 +1561,13 @@ impl Session {
             self.selected = None;
         } else if self.tool != Tool::Select {
             self.tool = Tool::Select;
+        } else if self.clip.is_some() {
+            self.clip = None;
+            self.clip_frame = None;
+            self.clip_grab = None;
+        } else if self.pending != Pending::None {
+            self.pending = Pending::None;
+            self.notice = None;
         } else {
             fx.push(Effect::Close);
             return;
@@ -1087,6 +1576,14 @@ impl Session {
     }
 
     fn finish(&mut self, output: Output, fx: &mut Vec<Effect>) {
+        if self.clip.is_some() {
+            match output {
+                Output::Copy => self.make_gif(false, fx),
+                Output::Save => self.make_gif(true, fx),
+                Output::Pin => {}
+            }
+            return;
+        }
         self.commit_text();
         let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
             return;
@@ -1152,49 +1649,6 @@ impl Session {
             StripItem::Save => self.finish(Output::Save, fx),
             StripItem::Pin => self.finish(Output::Pin, fx),
         }
-    }
-
-    /// The area an output without a selection is about: the selection, or the
-    /// monitor under the pointer.
-    fn subject(&self) -> Rect {
-        self.selection
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.monitor_of(self.pointer))
-            .round()
-            .intersect(&self.screen().bounds())
-    }
-
-    /// The recorded seconds as a clip of the selection, drawings included.
-    fn clip(&mut self, fx: &mut Vec<Effect>) {
-        if self.frames.len() < 2 {
-            self.notice = Some("nothing recorded to make a clip from".into());
-            fx.push(Effect::Redraw);
-            return;
-        }
-        self.commit_text();
-        let area = self.subject();
-        let frames: Vec<(Image, u32)> = self
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(i, frame)| {
-                let image = flatten_scaled(
-                    &frame.image,
-                    self.doc.items(),
-                    area,
-                    &self.fonts,
-                    self.scale,
-                );
-                // Each frame stays until the next one was seen; the last lingers.
-                let shown = match self.frames.get(i + 1) {
-                    Some(next) => frame.age_ms.saturating_sub(next.age_ms).clamp(100, 3000),
-                    None => 1500,
-                };
-                (image, shown)
-            })
-            .collect();
-        fx.push(Effect::SaveClip(frames));
-        fx.push(Effect::Close);
     }
 
     /// Two moments side by side with the change outlined, copied like a capture.
@@ -2343,31 +2797,232 @@ mod tests {
     }
 
     #[test]
-    fn k_turns_the_recording_into_a_clip_of_the_selection() {
-        let mut s = recorded();
-        drag(&mut s, pt(300.0, 200.0), pt(420.0, 260.0));
+    fn k_asks_for_a_gif_of_the_selection_and_plays_it_once_given() {
+        let mut s = selected();
         let fx = key(&mut s, 'k');
-        let [Effect::SaveClip(frames), Effect::Close] = &fx[..] else {
+        assert_eq!(
+            fx,
+            [
+                Effect::StartClip(Rect::new(200.0, 150.0, 400.0, 300.0)),
+                Effect::Redraw
+            ]
+        );
+        s.enter_clip(4000, 30);
+        assert_eq!(s.clip_time(), Some(0));
+        s.handle(Input::Tick(1500));
+        assert_eq!(s.clip_time(), Some(1500));
+        s.handle(Input::Tick(3000));
+        assert_eq!(s.clip_time(), Some(500), "it loops");
+        // Space pauses.
+        key(&mut s, ' ');
+        s.handle(Input::Tick(100));
+        assert_eq!(s.clip_time(), Some(500));
+    }
+
+    #[test]
+    fn the_bar_trims_the_gif_and_enter_writes_it_with_the_drawings() {
+        let mut s = selected();
+        key(&mut s, 'k');
+        s.enter_clip(10_000, 30);
+        let bar = s.clip_bar().unwrap();
+        let y = bar.track.center().y;
+        // Pull the start to 2 s and the end to 6 s.
+        s.handle(Input::PointerDown(pt(bar.x_of(0), y)));
+        s.handle(Input::PointerMove(pt(bar.x_of(2000), y)));
+        s.handle(Input::PointerUp(pt(bar.x_of(2000), y)));
+        s.handle(Input::PointerDown(pt(bar.x_of(10_000), y)));
+        s.handle(Input::PointerMove(pt(bar.x_of(6000), y)));
+        s.handle(Input::PointerUp(pt(bar.x_of(6000), y)));
+        let view = s.clip().unwrap().clone();
+        assert!((1950..=2050).contains(&view.from), "{view:?}");
+        assert!((5950..=6050).contains(&view.to), "{view:?}");
+        assert_eq!(view.at, view.from, "it plays the part left from its start");
+        // An arrow, drawn over the GIF.
+        key(&mut s, 'a');
+        drag(&mut s, pt(250.0, 200.0), pt(350.0, 260.0));
+        let fx = s.handle(Input::Key(Key::Enter, NONE));
+        let [
+            Effect::MakeGif {
+                area,
+                from,
+                to,
+                items,
+                save: false,
+            },
+            Effect::Close,
+        ] = &fx[..]
+        else {
             panic!("{fx:?}")
         };
-        assert_eq!(frames.len(), 3);
+        assert_eq!(*area, Rect::new(200.0, 150.0, 400.0, 300.0));
+        assert_eq!((*from, *to), (view.from, view.to));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].bounds().x < 100.0, "in the area's own coordinates");
+    }
+
+    #[test]
+    fn escape_leaves_the_gif_for_the_still_picture() {
+        let mut s = selected();
+        key(&mut s, 'k');
+        s.enter_clip(3000, 30);
+        s.handle(Input::Key(Key::Escape, NONE));
+        assert!(s.clip().is_none());
+        assert!(s.selection().is_some());
+    }
+
+    #[test]
+    fn while_a_gif_is_made_the_area_stays_put() {
+        let mut s = selected();
+        key(&mut s, 'k');
+        s.enter_clip(3000, 30);
+        drag(&mut s, pt(300.0, 300.0), pt(500.0, 500.0));
+        key(&mut s, 'f');
+        assert_eq!(s.selection(), Some(Rect::new(200.0, 150.0, 400.0, 300.0)));
+    }
+
+    #[test]
+    fn tab_steps_out_from_the_box_to_the_parts_of_the_window_and_the_window() {
+        // A window with a box in it and a part the system knows about (the
+        // page) around it.
+        let mut screen = Image::filled(800, 600, [255, 255, 255, 255]);
+        screen.fill_rect(Rect::new(100.0, 100.0, 600.0, 450.0), [40, 40, 40, 255]);
+        screen.fill_rect(Rect::new(200.0, 250.0, 120.0, 60.0), [90, 160, 230, 255]);
+        let window = Rect::new(80.0, 60.0, 640.0, 520.0);
+        let page = Rect::new(100.0, 100.0, 600.0, 470.0);
+        let mut s = Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            vec![window],
+            vec![Rect::new(0.0, 0.0, 800.0, 600.0)],
+            Options::default(),
+        );
+        s.set_panes(vec![(window, page)]);
+        s.handle(Input::PointerMove(pt(250.0, 280.0)));
+        let button = Rect::new(200.0, 250.0, 120.0, 60.0);
+        assert_eq!(s.hover_target(), Some(button));
+        s.handle(Input::Key(Key::Tab, NONE));
+        assert_eq!(s.hover_target(), Some(page));
+        s.handle(Input::Key(Key::Tab, NONE));
+        assert_eq!(s.hover_target(), Some(window));
+        s.handle(Input::Key(Key::Tab, NONE));
+        assert_eq!(s.hover_target(), Some(window), "it stops at the window");
+        s.handle(Input::Key(Key::Tab, SHIFT));
+        assert_eq!(s.hover_target(), Some(page));
+        // Moving to another box starts again from the smallest.
+        s.handle(Input::PointerMove(pt(600.0, 520.0)));
+        s.handle(Input::PointerMove(pt(260.0, 270.0)));
+        assert_eq!(s.hover_target(), Some(button));
+        // A click selects what is offered.
+        s.handle(Input::Key(Key::Tab, NONE));
+        drag(&mut s, pt(260.0, 270.0), pt(260.0, 270.0));
+        assert_eq!(s.selection(), Some(page));
+    }
+
+    #[test]
+    fn the_page_of_a_full_screen_browser_is_offered_before_the_window() {
+        // A maximised browser: the page is most of the window but not all of
+        // it, and a layer the size of the whole window is not a part.
+        let screen = Image::filled(800, 600, [32, 32, 32, 255]);
+        let window = Rect::new(0.0, 0.0, 800.0, 560.0);
+        let page = Rect::new(20.0, 40.0, 780.0, 520.0);
+        let mut s = Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            vec![window],
+            vec![Rect::new(0.0, 0.0, 800.0, 600.0)],
+            Options::default(),
+        );
+        s.set_panes(vec![(window, page), (window, window)]);
+        s.handle(Input::PointerMove(pt(400.0, 300.0)));
+        assert_eq!(s.hover_target(), Some(page));
+        s.handle(Input::Key(Key::Tab, NONE));
+        assert_eq!(s.hover_target(), Some(window));
+    }
+
+    #[test]
+    fn parts_of_other_windows_are_not_offered() {
+        let screen = Image::filled(800, 600, [255, 255, 255, 255]);
+        let front = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let back = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let mut s = Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            vec![front, back],
+            vec![back],
+            Options::default(),
+        );
+        s.set_panes(vec![(back, Rect::new(50.0, 50.0, 200.0, 150.0))]);
+        s.handle(Input::PointerMove(pt(100.0, 100.0)));
+        s.handle(Input::Key(Key::Tab, NONE));
+        assert_eq!(s.hover_target(), Some(front));
+    }
+
+    fn quick() -> Session {
+        let screen = Image::filled(800, 600, [255, 255, 255, 255]);
+        Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            vec![Rect::new(100.0, 100.0, 300.0, 200.0)],
+            vec![Rect::new(0.0, 0.0, 800.0, 600.0)],
+            Options {
+                quick: true,
+                ..Options::default()
+            },
+        )
+    }
+
+    #[test]
+    fn quickly_an_area_is_copied_the_moment_it_is_chosen() {
+        let mut s = quick();
+        let fx = drag(&mut s, pt(200.0, 150.0), pt(600.0, 450.0));
         assert!(
-            frames
-                .iter()
-                .all(|(image, _)| (image.width, image.height) == (120, 60))
+            matches!(&fx[..], [.., Effect::Copy(img), Effect::Close, _] | [.., Effect::Copy(img), Effect::Close] if img.width == 400),
+            "{fx:?}"
         );
-        assert_eq!(
-            frames.iter().map(|(_, ms)| *ms).collect::<Vec<_>>(),
-            [1000, 1000, 1500]
+        // A click on a window copies the window.
+        let mut s = quick();
+        s.handle(Input::PointerMove(pt(150.0, 150.0)));
+        let fx = drag(&mut s, pt(150.0, 150.0), pt(150.0, 150.0));
+        assert!(fx.contains(&Effect::Close), "{fx:?}");
+        // So does the whole monitor.
+        let mut s = quick();
+        assert!(key(&mut s, 'f').contains(&Effect::Close));
+    }
+
+    #[test]
+    fn quickly_shift_or_a_tool_first_keeps_it_open_to_draw() {
+        let mut s = quick();
+        s.handle(Input::Mods(SHIFT));
+        let fx = drag(&mut s, pt(200.0, 150.0), pt(600.0, 450.0));
+        assert!(!fx.contains(&Effect::Close));
+        assert!(s.selection().is_some());
+
+        let mut s = quick();
+        key(&mut s, 'a');
+        assert!(s.notice().is_some(), "it says what to do next");
+        let fx = drag(&mut s, pt(200.0, 150.0), pt(600.0, 450.0));
+        assert!(!fx.contains(&Effect::Close));
+        assert_eq!(s.tool(), Tool::Arrow);
+        // Once open, choosing again does not copy.
+        assert!(!s.quick());
+    }
+
+    #[test]
+    fn quickly_k_first_makes_a_gif_of_the_area_chosen() {
+        let mut s = quick();
+        key(&mut s, 'k');
+        let fx = drag(&mut s, pt(200.0, 150.0), pt(600.0, 450.0));
+        assert!(
+            fx.contains(&Effect::StartClip(Rect::new(200.0, 150.0, 400.0, 300.0))),
+            "{fx:?}"
         );
-        assert_eq!(
-            frames[1].0.pixel(5, 5),
-            [20, 20, 20, 255],
-            "the middle frame has the box"
-        );
-        let mut alone = selected();
-        assert_eq!(key(&mut alone, 'k'), vec![Effect::Redraw]);
-        assert!(alone.notice().is_some());
+        assert!(!fx.contains(&Effect::Close));
+        // Escape before choosing forgets the request.
+        let mut s = quick();
+        key(&mut s, 'k');
+        s.handle(Input::Key(Key::Escape, NONE));
+        let fx = drag(&mut s, pt(200.0, 150.0), pt(600.0, 450.0));
+        assert!(fx.contains(&Effect::Close), "copied as usual");
     }
 
     #[test]

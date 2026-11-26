@@ -12,3 +12,5 @@ tiny-skia.workspace = true
 fontdue = "0.9"
 fontdb = "0.24"
 png = "0.18"
+gif = "0.14"
+color_quant = "1.1"

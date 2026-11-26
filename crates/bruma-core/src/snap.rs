@@ -19,6 +19,9 @@ const EDGE: i32 = 28;
 const MIN_SIDE: f32 = 12.0;
 /// A flat region covering more of the screen than this is background.
 const MAX_SHARE: f32 = 0.45;
+/// Inside a window, a flat region this close to the whole window is the
+/// window itself, which is selected as a window.
+const WHOLE: f32 = 0.97;
 /// How far the search for the border of a busy element reaches.
 const REACH: i32 = 1400;
 
@@ -39,35 +42,55 @@ fn px(image: &Image, x: i32, y: i32) -> &[u8] {
     &image.rgba[i..i + 4]
 }
 
-/// The flat-coloured area around `p`: a button, a card, a filled circle.
-/// `None` when it is tiny (text, detail) or so large it must be background.
-pub fn flat_region(image: &Image, p: Point) -> Option<Rect> {
+/// The flat-coloured area around `p`: a button, a card, a filled circle,
+/// the body of a page. `None` when it is tiny (text, detail) or so large it
+/// must be background.
+///
+/// `within` is the window under `p`. Inside a window "large" is measured
+/// against the window, not the screen, and the search stays inside it: the
+/// body of a page can fill most of the screen and still be the thing meant.
+/// Without a window (the desktop) a colour filling much of the screen is the
+/// wallpaper.
+pub fn flat_region(image: &Image, p: Point, within: Option<Rect>) -> Option<Rect> {
     let (w, h) = (image.width as i32, image.height as i32);
     let (sx, sy) = (p.x.floor() as i32, p.y.floor() as i32);
     if sx < 0 || sy < 0 || sx >= w || sy >= h {
         return None;
     }
+    let window = within
+        .map(|r| r.round().intersect(&image.bounds()))
+        .filter(|r| !r.is_empty() && r.contains(p));
+    let (bx0, by0, bx1, by1) = match window {
+        Some(b) => (b.x as i32, b.y as i32, b.right() as i32, b.bottom() as i32),
+        None => (0, 0, w, h),
+    };
     let seed = [
         px(image, sx, sy)[0],
         px(image, sx, sy)[1],
         px(image, sx, sy)[2],
     ];
-    // A colour found at half of a grid of sample points is the background;
-    // there is no need to fill half the screen to learn that.
-    let (cols, rows) = (48, 27);
-    let same = (0..rows)
-        .flat_map(|j| (0..cols).map(move |i| (i, j)))
-        .filter(|&(i, j)| {
-            near(
-                px(image, (i * w + w / 2) / cols, (j * h + h / 2) / rows),
-                &seed,
-            )
-        })
-        .count();
-    if same * 2 >= (cols * rows) as usize {
-        return None;
+    // On the desktop, a colour found at half of a grid of sample points is
+    // the wallpaper; there is no need to fill half the screen to learn that.
+    if window.is_none() {
+        let (cols, rows) = (48, 27);
+        let same = (0..rows)
+            .flat_map(|j| (0..cols).map(move |i| (i, j)))
+            .filter(|&(i, j)| {
+                near(
+                    px(image, (i * w + w / 2) / cols, (j * h + h / 2) / rows),
+                    &seed,
+                )
+            })
+            .count();
+        if same * 2 >= (cols * rows) as usize {
+            return None;
+        }
     }
-    let limit = (w as f32 * h as f32 * MAX_SHARE) as usize;
+    let area = ((bx1 - bx0) as f32) * ((by1 - by0) as f32);
+    let limit = match window {
+        Some(_) => (area * WHOLE) as usize,
+        None => (w as f32 * h as f32 * MAX_SHARE) as usize,
+    };
     let mut seen = vec![false; (w * h) as usize];
     let mut stack = vec![(sx, sy)];
     let (mut x0, mut y0, mut x1, mut y1) = (sx, sy, sx, sy);
@@ -79,10 +102,10 @@ pub fn flat_region(image: &Image, p: Point) -> Option<Rect> {
         }
         // Fill the whole run of matching pixels on this row.
         let (mut l, mut r) = (x, x);
-        while l > 0 && !seen[at(l - 1)] && near(px(image, l - 1, y), &seed) {
+        while l > bx0 && !seen[at(l - 1)] && near(px(image, l - 1, y), &seed) {
             l -= 1;
         }
-        while r + 1 < w && !seen[at(r + 1)] && near(px(image, r + 1, y), &seed) {
+        while r + 1 < bx1 && !seen[at(r + 1)] && near(px(image, r + 1, y), &seed) {
             r += 1;
         }
         seen[at(l)..=at(r)].fill(true);
@@ -93,7 +116,7 @@ pub fn flat_region(image: &Image, p: Point) -> Option<Rect> {
         (x0, y0, x1, y1) = (x0.min(l), y0.min(y), x1.max(r), y1.max(y));
         // Queue one pixel for each matching run on the rows above and below.
         for ny in [y - 1, y + 1] {
-            if ny < 0 || ny >= h {
+            if ny < by0 || ny >= by1 {
                 continue;
             }
             let mut inside = false;
@@ -112,6 +135,12 @@ pub fn flat_region(image: &Image, p: Point) -> Option<Rect> {
         (x1 - x0 + 1) as f32,
         (y1 - y0 + 1) as f32,
     );
+    // As good as the whole window: that is the window, not a part of it.
+    if let Some(b) = window {
+        if rect.w >= b.w * WHOLE && rect.h >= b.h * WHOLE {
+            return None;
+        }
+    }
     (rect.w >= MIN_SIDE && rect.h >= MIN_SIDE).then_some(rect)
 }
 
@@ -175,9 +204,10 @@ pub fn busy_box(image: &Image, p: Point) -> Option<Rect> {
     (rect.w >= 2.0 * MIN_SIDE && rect.h >= 2.0 * MIN_SIDE && share <= MAX_SHARE).then_some(rect)
 }
 
-/// The visual element under `p`, if there is one worth selecting.
-pub fn element_at(image: &Image, p: Point) -> Option<Rect> {
-    flat_region(image, p).or_else(|| busy_box(image, p))
+/// The visual element under `p`, if there is one worth selecting; `within`
+/// is the window under it, if any.
+pub fn element_at(image: &Image, p: Point, within: Option<Rect>) -> Option<Rect> {
+    flat_region(image, p, within).or_else(|| busy_box(image, p))
 }
 
 /// How many of the rows `y0..y1` have an edge between columns `b - 1` and `b`.
@@ -269,11 +299,11 @@ mod tests {
         let mut img = page();
         img.fill_rect(Rect::new(100.0, 80.0, 200.0, 120.0), DARK);
         assert_eq!(
-            element_at(&img, Point::new(150.0, 100.0)),
+            element_at(&img, Point::new(150.0, 100.0), None),
             Some(Rect::new(100.0, 80.0, 200.0, 120.0))
         );
         assert_eq!(
-            element_at(&img, Point::new(299.0, 199.0)),
+            element_at(&img, Point::new(299.0, 199.0), None),
             Some(Rect::new(100.0, 80.0, 200.0, 120.0))
         );
     }
@@ -290,23 +320,62 @@ mod tests {
             }
         }
         assert_eq!(
-            element_at(&img, Point::new(300.0, 200.0)),
+            element_at(&img, Point::new(300.0, 200.0), None),
             Some(Rect::new(240.0, 140.0, 121.0, 121.0))
         );
+    }
+
+    #[test]
+    fn the_body_of_a_page_is_found_inside_its_window_but_wallpaper_is_not() {
+        // A browser filling the screen: a light header, and a dark body that
+        // covers most of the screen with a card and some text on it.
+        let mut img = Image::filled(800, 600, [30, 30, 30, 255]);
+        img.fill_rect(Rect::new(0.0, 0.0, 800.0, 40.0), [60, 60, 60, 255]);
+        img.fill_rect(Rect::new(100.0, 120.0, 160.0, 90.0), [70, 70, 70, 255]);
+        img.fill_rect(Rect::new(100.0, 300.0, 200.0, 8.0), [220, 220, 220, 255]);
+        let window = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let body = flat_region(&img, Point::new(500.0, 400.0), Some(window));
+        assert_eq!(
+            body,
+            Some(Rect::new(0.0, 40.0, 800.0, 560.0)),
+            "the body, below the header"
+        );
+        // The header is still found on its own.
+        let header = flat_region(&img, Point::new(400.0, 20.0), Some(window));
+        assert_eq!(header, Some(Rect::new(0.0, 0.0, 800.0, 40.0)));
+        // On the desktop, the same colour over most of the screen is wallpaper.
+        assert_eq!(flat_region(&img, Point::new(500.0, 400.0), None), None);
+        // A flat colour filling the whole window is the window: no element.
+        let plain = Image::filled(400, 300, [200, 200, 200, 255]);
+        let whole = Rect::new(0.0, 0.0, 400.0, 300.0);
+        assert_eq!(
+            flat_region(&plain, Point::new(50.0, 50.0), Some(whole)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_search_stays_inside_the_window() {
+        let img = Image::filled(800, 600, [30, 30, 30, 255]);
+        let window = Rect::new(100.0, 100.0, 300.0, 200.0);
+        let mut framed = img.clone();
+        framed.fill_rect(Rect::new(100.0, 100.0, 300.0, 30.0), [90, 90, 90, 255]);
+        let found = flat_region(&framed, Point::new(200.0, 200.0), Some(window));
+        assert_eq!(found, Some(Rect::new(100.0, 130.0, 300.0, 170.0)));
     }
 
     #[test]
     fn the_background_is_not_an_element() {
         let mut img = page();
         img.fill_rect(Rect::new(100.0, 80.0, 60.0, 60.0), DARK);
-        assert_eq!(element_at(&img, Point::new(400.0, 300.0)), None);
+        assert_eq!(element_at(&img, Point::new(400.0, 300.0), None), None);
     }
 
     #[test]
     fn text_sized_specks_are_not_elements() {
         let mut img = page();
         img.fill_rect(Rect::new(100.0, 100.0, 6.0, 9.0), DARK);
-        assert_eq!(flat_region(&img, Point::new(102.0, 104.0)), None);
+        assert_eq!(flat_region(&img, Point::new(102.0, 104.0), None), None);
     }
 
     #[test]
@@ -319,7 +388,7 @@ mod tests {
             img.fill_rect(Rect::new(120.0, 100.0 + i as f32 * 20.0, 200.0, 8.0), DARK);
         }
         assert_eq!(
-            element_at(&img, Point::new(380.0, 260.0)),
+            element_at(&img, Point::new(380.0, 260.0), None),
             Some(Rect::new(100.0, 80.0, 300.0, 200.0))
         );
     }
@@ -330,13 +399,16 @@ mod tests {
         let photo = Rect::new(150.0, 90.0, 240.0, 160.0);
         noise(&mut img, photo);
         assert_eq!(
-            flat_region(&img, Point::new(270.0, 170.0)),
+            flat_region(&img, Point::new(270.0, 170.0), None),
             None,
             "a photo has no flat area"
         );
-        assert_eq!(element_at(&img, Point::new(270.0, 170.0)), Some(photo));
         assert_eq!(
-            element_at(&img, Point::new(152.0, 92.0)),
+            element_at(&img, Point::new(270.0, 170.0), None),
+            Some(photo)
+        );
+        assert_eq!(
+            element_at(&img, Point::new(152.0, 92.0), None),
             Some(photo),
             "near its corner too"
         );
@@ -358,21 +430,21 @@ mod tests {
         let mut img = page();
         let photo = Rect::new(0.0, 0.0, 200.0, 150.0);
         noise(&mut img, photo);
-        assert_eq!(element_at(&img, Point::new(100.0, 75.0)), Some(photo));
+        assert_eq!(element_at(&img, Point::new(100.0, 75.0), None), Some(photo));
     }
 
     #[test]
     fn busy_content_filling_the_screen_is_not_an_element() {
         let mut img = page();
         noise(&mut img, Rect::new(0.0, 0.0, 600.0, 400.0));
-        assert_eq!(element_at(&img, Point::new(300.0, 200.0)), None);
+        assert_eq!(element_at(&img, Point::new(300.0, 200.0), None), None);
     }
 
     #[test]
     fn points_outside_the_image_are_ignored() {
         let img = page();
-        assert_eq!(element_at(&img, Point::new(-5.0, 10.0)), None);
-        assert_eq!(element_at(&img, Point::new(10.0, 4000.0)), None);
+        assert_eq!(element_at(&img, Point::new(-5.0, 10.0), None), None);
+        assert_eq!(element_at(&img, Point::new(10.0, 4000.0), None), None);
     }
 
     #[test]
