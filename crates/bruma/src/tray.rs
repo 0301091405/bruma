@@ -56,8 +56,8 @@ pub fn mark(size: u32) -> Vec<u8> {
     }
 
     let t = (s / 10.0).round().max(1.0);
-    let inset = (s * 0.22).round();
-    let len = (s * 0.22).round();
+    let inset = (s * 0.19).round();
+    let len = (s * 0.25).round();
     let mut marks = paint(PAPER);
     marks.anti_alias = false;
     for (x, sx) in [(inset, 1.0), (s - inset, -1.0)] {
@@ -77,7 +77,11 @@ pub fn mark(size: u32) -> Vec<u8> {
             }
         }
     }
-    let dot = (s * 0.16).round().max(2.0);
+    // Even on an even icon (and odd on an odd one), so it sits in the middle.
+    let mut dot = (s * 0.22).round().max(2.0);
+    if (size as f32 - dot) % 2.0 != 0.0 {
+        dot += 1.0;
+    }
     let mut accent = paint(ACCENT);
     accent.anti_alias = false;
     if let Some(rect) = Rect::from_xywh(
@@ -257,6 +261,20 @@ pub fn pretty(hotkey: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dot_is_in_the_middle_at_every_size() {
+        for size in [16u32, 20, 24, 32] {
+            let rgba = mark(size);
+            let accent = |x: u32, y: u32| {
+                let i = ((y * size + x) * 4) as usize;
+                rgba[i..i + 3] == ACCENT[..]
+            };
+            let row: Vec<u32> = (0..size).filter(|&x| accent(x, size / 2)).collect();
+            let (first, last) = (row[0], *row.last().unwrap());
+            assert_eq!(first, size - 1 - last, "{size}: {first}..{last}");
+        }
+    }
 
     #[test]
     fn mark_has_transparent_corners_and_an_accent_centre() {

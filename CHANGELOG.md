@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-11-26
+
+- A Bruma that was ended without closing no longer leaves its icon behind in
+  the notification area; the next start removes it.
+- The tray icon is sharper at small sizes, with the dot in the middle.
+
 ## 0.7.0 - 2026-11-26
 
 - Choosing an area copies it straight away. Click the preview card to open it

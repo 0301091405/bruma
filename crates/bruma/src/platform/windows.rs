@@ -1094,14 +1094,35 @@ fn icon_from_rgba(
     }
 }
 
+/// The icon's lasting name. With it, an icon left behind by a Bruma that was
+/// ended without closing (killed, or stopped by an update) is replaced
+/// instead of piling up next to the new one.
+const TRAY_GUID: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6fa6fde6_286d_488c_9d76_5ffe633bfe59);
+
 /// Puts the icon in the notification area and asks for the shell's newer,
-/// simpler way of reporting clicks.
-fn show_tray_icon(data: &windows::Win32::UI::Shell::NOTIFYICONDATAW) -> bool {
-    use windows::Win32::UI::Shell::{NIM_ADD, NIM_SETVERSION, Shell_NotifyIconW};
-    unsafe {
+/// simpler way of reporting clicks. An icon of an earlier Bruma still there
+/// is taken away first. Windows ties the lasting name to the program's path,
+/// so a copy run from somewhere else falls back to an icon without it.
+fn show_tray_icon(data: &mut windows::Win32::UI::Shell::NOTIFYICONDATAW) -> bool {
+    use windows::Win32::UI::Shell::{
+        NIF_GUID, NIM_ADD, NIM_DELETE, NIM_SETVERSION, Shell_NotifyIconW,
+    };
+    let add = |data: &windows::Win32::UI::Shell::NOTIFYICONDATAW| unsafe {
         Shell_NotifyIconW(NIM_ADD, data).as_bool()
             && Shell_NotifyIconW(NIM_SETVERSION, data).as_bool()
+    };
+    if data.uFlags.0 & NIF_GUID.0 != 0 {
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, data);
+        }
+        if add(data) {
+            return true;
+        }
+        data.uFlags.0 &= !NIF_GUID.0;
+        data.guidItem = windows::core::GUID::zeroed();
     }
+    add(data)
 }
 
 unsafe extern "system" fn tray_proc(
@@ -1138,8 +1159,13 @@ unsafe extern "system" fn tray_proc(
             .filter(|state| state.taskbar_created != 0 && msg == state.taskbar_created)
             .map(|state| state.data)
     });
-    if let Some(data) = again {
-        show_tray_icon(&data);
+    if let Some(mut data) = again {
+        show_tray_icon(&mut data);
+        TRAY.with(|tray| {
+            if let Some(state) = tray.borrow_mut().as_mut() {
+                state.data = data;
+            }
+        });
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -1160,7 +1186,8 @@ impl NotifyIcon {
     ) -> Result<Self, String> {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::Shell::{
-            NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFYICON_VERSION_4,
+            NOTIFYICONDATAW,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, RegisterClassW, RegisterWindowMessageW, WINDOW_EX_STYLE, WNDCLASSW,
@@ -1199,9 +1226,10 @@ impl NotifyIcon {
                 cbSize: size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: hwnd,
                 uID: 1,
-                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_GUID,
                 uCallbackMessage: TRAY_MESSAGE,
                 hIcon: icon,
+                guidItem: TRAY_GUID,
                 ..Default::default()
             };
             for (slot, c) in data.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
@@ -1209,6 +1237,9 @@ impl NotifyIcon {
             }
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+            // Early at sign-in the taskbar may not be there yet; the icon is
+            // added again when Explorer says it has started.
+            show_tray_icon(&mut data);
             TRAY.with(|tray| {
                 *tray.borrow_mut() = Some(TrayState {
                     on_click: Box::new(on_click),
@@ -1216,9 +1247,6 @@ impl NotifyIcon {
                     taskbar_created,
                 });
             });
-            // Early at sign-in the taskbar may not be there yet; the icon is
-            // added when Explorer says it has started.
-            show_tray_icon(&data);
             Ok(Self { hwnd, icon })
         }
     }
