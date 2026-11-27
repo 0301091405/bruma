@@ -257,10 +257,11 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("bruma");
         }
-        match (self.save_dir.strip_prefix('~'), &dirs) {
+        let dir = match (self.save_dir.strip_prefix('~'), &dirs) {
             (Some(rest), Some(d)) => d.home_dir().join(rest.trim_start_matches(['/', '\\'])),
             _ => PathBuf::from(&self.save_dir),
-        }
+        };
+        crate::platform::reachable(&dir)
     }
 
     /// A path in the save folder that does not exist yet.

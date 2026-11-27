@@ -36,6 +36,9 @@ irm https://raw.githubusercontent.com/0301091405/bruma/main/install.ps1 | iex
 [bruma.exe](https://github.com/0301091405/bruma/releases/latest/download/bruma.exe)
 is the same program without setup. Put it anywhere and run it.
 
+On Windows 11, `PrintScreen` normally opens the Snipping Tool. Bruma takes
+the key back without changing that setting.
+
 The files aren't signed, so SmartScreen may warn you. Choose "More info", then
 "Run anyway". To remove Bruma, use "Installed apps" in Windows Settings.
 
@@ -100,12 +103,20 @@ your disk and a local history folder, nowhere else.
 While Bruma runs it keeps a short recording of the screen in memory for rewind
 and GIFs. It reads only what changes and uses a few percent of one core while
 something on screen keeps moving. While a game or a film fills the screen it
-stops and gives that memory back. Setting `rewind = 0`
+stops and gives that memory back. On battery it records at half the rate, and
+not at all with the battery saver on. Setting `rewind = 0`
 and `clip = 0` in the settings file turns it off.
 
 Running as administrator means anything Bruma starts runs that way too,
 including a command set in `run_after`. Turn it off in Settings if you'd
 rather not.
+
+## When something doesn't work
+
+Right-click the tray icon and choose "Copy a report for a bug", or run
+`bruma doctor`. It describes your Windows, monitors and Bruma's settings, and
+leaves out your name and folders. Paste it into an
+[issue](https://github.com/0301091405/bruma/issues).
 
 ## Building
 

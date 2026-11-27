@@ -39,6 +39,48 @@ const FAST_TICK: Duration = Duration::from_millis(33);
 /// all the time (a video, full screen) comes near it; it then keeps fewer
 /// seconds.
 const TAPE_BUDGET: usize = 320 * 1024 * 1024;
+
+/// How often the recorder asks how the machine is powered.
+const POWER_EVERY: Duration = Duration::from_secs(5);
+
+/// The GIF tape's beat: thirty a second on mains power, fifteen on battery
+/// (waking the processor thirty times a second costs battery), ten with the
+/// battery saver on, when the tape is not kept at all.
+fn beat_for(power: platform::Power) -> Duration {
+    match power {
+        platform::Power::Mains => FAST_TICK,
+        platform::Power::Battery => FAST_TICK * 2,
+        platform::Power::Saving => TICK,
+    }
+}
+
+/// The memory the GIF tape and the rewind frames may hold, for a desktop of
+/// `pixels`, a window of `window` and a machine with `memory` bytes: as set
+/// for a 1080p screen, grown with the screen (four times the pixels at 4K)
+/// so that the seconds asked for are kept, but never more than a sixteenth
+/// of the machine's memory, nor than a fixed ceiling.
+fn budgets(pixels: usize, window: Duration, memory: u64) -> (usize, usize) {
+    const MB: usize = 1024 * 1024;
+    let cap = ((memory / 16) as usize).max(64 * MB);
+    let scale = pixels as f64 / (1920.0 * 1080.0);
+    let upper = (640 * MB).min(cap);
+    let tape = ((TAPE_BUDGET as f64 * scale) as usize).clamp((128 * MB).min(upper), upper);
+    // Two frames a second, four bytes a pixel, and two to spare.
+    let wanted = (window.as_secs_f64() * 2.0 + 2.0) as usize * pixels * 4;
+    let upper = (512 * MB).min(cap);
+    let stills = wanted.clamp(BUDGET_BYTES.min(upper), upper);
+    (tape, stills)
+}
+
+/// [`budgets`] for this machine.
+fn budgets_here(pixels: usize, window: Duration) -> (usize, usize) {
+    static MEMORY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    budgets(
+        pixels,
+        window,
+        *MEMORY.get_or_init(platform::installed_memory),
+    )
+}
 /// A screen that has not changed and a user who has touched nothing for this
 /// long are sampled at the quiet pace.
 const QUIET_AFTER: Duration = Duration::from_secs(2);
@@ -136,8 +178,10 @@ fn seen_again(frames: &mut VecDeque<Recorded>, now: Instant, window: Duration) {
 /// Drops frames older than `window` or over the memory budget.
 fn prune(frames: &mut VecDeque<Recorded>, now: Instant, window: Duration) {
     let bytes = |f: &VecDeque<Recorded>| f.iter().map(|r| r.image.rgba.len()).sum::<usize>();
+    let pixels = frames.back().map_or(0, |r| r.image.rgba.len() / 4);
+    let (_, budget) = budgets_here(pixels, window);
     while frames.len() > 1
-        && (now.duration_since(frames[0].last_seen) > window || bytes(frames) > BUDGET_BYTES)
+        && (now.duration_since(frames[0].last_seen) > window || bytes(frames) > budget)
     {
         frames.pop_front();
     }
@@ -347,7 +391,14 @@ impl Recorder<'_> {
             _ => {
                 let keep = self.shared.clip.as_millis() as u64 + 1000;
                 *tape = Some((
-                    Tape::new(raw.bytes, w, h, ms, keep, TAPE_BUDGET),
+                    Tape::new(
+                        raw.bytes,
+                        w,
+                        h,
+                        ms,
+                        keep,
+                        budgets_here(w * h, self.shared.window).0,
+                    ),
                     raw.origin,
                 ));
             }
@@ -457,17 +508,19 @@ fn run(shared: &Shared, requests: mpsc::Receiver<Request>, in_fullscreen: bool, 
     // 15.6 ms), turning 33 ms into 47; a plain sleep is precise.
     let steady = !shared.clip.is_zero();
     let mut beat = Instant::now();
+    let mut power = platform::power();
+    let mut power_at = Instant::now();
     loop {
         let request = if steady {
             let now = Instant::now();
             if beat > now {
                 thread::sleep(beat - now);
             }
-            beat += FAST_TICK;
+            beat += beat_for(power);
             let now = Instant::now();
             if beat < now {
                 // Fell behind (the machine was busy): start the beat again.
-                beat = now + FAST_TICK;
+                beat = now + beat_for(power);
             }
             match requests.try_recv() {
                 Ok(reply) => Ok(reply),
@@ -503,7 +556,15 @@ fn run(shared: &Shared, requests: mpsc::Receiver<Request>, in_fullscreen: bool, 
             continue;
         }
         // The tape, between the samples.
-        if !shared.clip.is_zero() && recorder.eyes.duplicator.is_some() {
+        // How the machine is powered, looked at now and then.
+        if now.duration_since(power_at) > POWER_EVERY {
+            power = platform::power();
+            power_at = now;
+        }
+        if !shared.clip.is_zero()
+            && power != platform::Power::Saving
+            && recorder.eyes.duplicator.is_some()
+        {
             recorder.refresh(now);
         }
         let since = now.duration_since(sampled_at);
@@ -670,6 +731,24 @@ impl Drop for Rewind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_kept_grows_with_the_screen_but_stays_within_the_machine() {
+        const MB: usize = 1024 * 1024;
+        const GB: u64 = 1 << 30;
+        let hd = 1920 * 1080;
+        let uhd = 3840 * 2160;
+        let four = Duration::from_secs(4);
+        // 1080p on a 16 GB machine: as before.
+        assert_eq!(budgets(hd, four, 16 * GB), (TAPE_BUDGET, BUDGET_BYTES));
+        // 4K: room for the four seconds of frames, and a larger tape.
+        let (tape, stills) = budgets(uhd, four, 16 * GB);
+        assert!(tape > TAPE_BUDGET && tape <= 640 * MB, "{tape}");
+        assert!(stills >= 10 * uhd * 4, "{stills}");
+        // A 4 GB machine keeps to a sixteenth of it.
+        let (tape, stills) = budgets(uhd, four, 4 * GB);
+        assert!(tape <= 256 * MB && stills <= 256 * MB, "{tape} {stills}");
+    }
 
     fn image(v: u8) -> Image {
         Image::filled(4, 4, [v, v, v, 255])

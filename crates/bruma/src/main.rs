@@ -5,6 +5,8 @@
 mod app;
 mod cli;
 mod config;
+mod crash;
+mod doctor;
 mod history;
 mod lab;
 mod overlay;
@@ -254,6 +256,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A note, and the background process back, if anything goes wrong past
+    // repair.
+    crash::install(matches!(command, Command::Background | Command::Takeover));
 
     let (config, config_error) = Config::load();
     if let Some(problem) = &config_error {
@@ -355,10 +360,23 @@ fn main() -> ExitCode {
             }
             Ok(())
         }
-        Command::Games(true) => std::env::current_exe()
-            .map_err(|e| e.to_string())
-            .and_then(|exe| platform::create_games_task(&exe)),
-        Command::Games(false) => {
+        Command::Games(true, user) => {
+            // Windows may have asked for another account's password (a
+            // person without administrator rights of their own): a task made
+            // here would start Bruma as that account. Exit code 2 says so.
+            let me = std::env::var("USERNAME").unwrap_or_default();
+            if user.is_some_and(|user| !user.eq_ignore_ascii_case(&me)) {
+                return ExitCode::from(2);
+            }
+            std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| platform::create_games_task(&exe))
+        }
+        Command::Doctor => {
+            print!("{}", doctor::report());
+            Ok(())
+        }
+        Command::Games(false, _) => {
             platform::delete_games_task();
             Ok(())
         }

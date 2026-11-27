@@ -5,7 +5,7 @@ mod duplication;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use self::duplication::Duplicator;
+pub use self::duplication::{Duplicator, describe as describe_monitors};
 #[cfg(windows)]
 pub use self::windows::*;
 

@@ -368,6 +368,23 @@ impl Overlay {
     }
 
     /// A short message on the overlay.
+    /// Over a game that ran the screen at a size of its own: once Windows
+    /// has put the desktop back, the overlay (the size the game ran at) is
+    /// moved to the middle of the screen instead of staying in its corner.
+    pub fn fit_desktop(&self) {
+        let (origin, (w, h)) = platform::virtual_screen();
+        let (ow, oh) = (self.size.width as i32, self.size.height as i32);
+        if (w as i32, h as i32) == (ow, oh) {
+            return;
+        }
+        let x = origin.0 + (w as i32 - ow).max(0) / 2;
+        let y = origin.1 + (h as i32 - oh).max(0) / 2;
+        let at = winit::dpi::PhysicalPosition::new(x, y);
+        if self.window.outer_position().ok() != Some(at) {
+            self.window.set_outer_position(at);
+        }
+    }
+
     pub fn say(&mut self, text: &str) {
         self.session.say(text);
         self.window.request_redraw();

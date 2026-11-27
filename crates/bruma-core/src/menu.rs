@@ -19,6 +19,8 @@ pub enum Entry {
     History,
     Lab,
     Settings,
+    /// Copy what `bruma doctor` says, for a bug report.
+    Report,
     Quit,
 }
 
@@ -31,6 +33,7 @@ const ENTRIES: &[Option<(Entry, &str)>] = &[
     Some((Entry::History, "History")),
     Some((Entry::Lab, "Try every feature")),
     Some((Entry::Settings, "Settings")),
+    Some((Entry::Report, "Copy a report for a bug")),
     None,
     Some((Entry::Quit, "Quit Bruma")),
 ];

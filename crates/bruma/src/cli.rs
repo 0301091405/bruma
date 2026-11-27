@@ -40,8 +40,11 @@ pub enum Command {
     /// Ask the running Bruma to quit.
     Quit,
     /// Make (`true`) or remove the task that starts Bruma as administrator.
-    /// Run as administrator by Bruma itself, after asking.
-    Games(bool),
+    /// Run as administrator by Bruma itself, after asking; with the name of
+    /// the person it is for, which must be the account it runs as.
+    Games(bool, Option<String>),
+    /// Print what Bruma sees of this computer, for a bug report.
+    Doctor,
     /// Run in the background, started by that task: the Bruma that started
     /// it is given a moment to quit first.
     Takeover,
@@ -77,6 +80,7 @@ USAGE
   bruma probe                          time the ways of reading the screen
   bruma settings                       show the settings of the running Bruma
   bruma quit                           stop the running Bruma
+  bruma doctor                         describe this computer, for a bug report
   bruma --help | --version
 
 Without -o, files go to the configured save folder.
@@ -128,10 +132,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("probe") => Ok(Command::Probe),
         Some("settings") => Ok(Command::Settings),
         Some("quit") => Ok(Command::Quit),
+        Some("doctor") => Ok(Command::Doctor),
         Some("takeover") => Ok(Command::Takeover),
         Some("games") => match it.next() {
-            Some("on") => Ok(Command::Games(true)),
-            Some("off") => Ok(Command::Games(false)),
+            Some("on") => Ok(Command::Games(true, it.next().map(String::from))),
+            Some("off") => Ok(Command::Games(false, None)),
             _ => Err("games takes 'on' or 'off'".into()),
         },
         Some("lab") => Ok(Command::Lab),
@@ -272,8 +277,13 @@ mod tests {
         assert_eq!(parse(&args("lab")), Ok(Command::Lab));
         assert_eq!(parse(&args("quit")), Ok(Command::Quit));
         assert_eq!(parse(&args("takeover")), Ok(Command::Takeover));
-        assert_eq!(parse(&args("games on")), Ok(Command::Games(true)));
-        assert_eq!(parse(&args("games off")), Ok(Command::Games(false)));
+        assert_eq!(parse(&args("games on")), Ok(Command::Games(true, None)));
+        assert_eq!(
+            parse(&args("games on someone")),
+            Ok(Command::Games(true, Some("someone".into())))
+        );
+        assert_eq!(parse(&args("games off")), Ok(Command::Games(false, None)));
+        assert_eq!(parse(&args("doctor")), Ok(Command::Doctor));
         assert!(parse(&args("games")).is_err());
         assert_eq!(parse(&args("autostart")), Ok(Command::Autostart(None)));
         assert_eq!(

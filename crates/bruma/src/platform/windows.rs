@@ -437,8 +437,71 @@ pub fn attention() -> Attention {
     // 4: presentation mode.
     match unsafe { SHQueryUserNotificationState() }.map(|state| state.0) {
         Ok(1) => Attention::Away,
-        Ok(2..=4) => Attention::FullScreen,
+        Ok(3) => Attention::FullScreen,
+        // "Busy" is also said when a window nobody sees covers the screen
+        // (the overlays of graphics drivers and chat programs), with the
+        // desktop in front: then it is the desktop. Only a window in front
+        // that covers its monitor makes it full screen.
+        Ok(2 | 4) if front_covers_its_monitor() => Attention::FullScreen,
         _ => Attention::Desktop,
+    }
+}
+
+/// Whether the window in front covers the whole of its monitor and is not
+/// the desktop or the taskbar.
+fn front_covers_its_monitor() -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe {
+        let front = GetForegroundWindow();
+        if front.is_invalid() {
+            return false;
+        }
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(front, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if matches!(
+            class.as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        ) {
+            return false;
+        }
+        // Windows nobody sees or uses cover the screen too: the overlays of
+        // graphics drivers and chat programs let clicks through and never
+        // take the keyboard, and hidden system windows (Start, search) are
+        // cloaked. The keyboard can still land on one for a moment after a
+        // window closes. None of them is a game.
+        const NOACTIVATE: u32 = 0x0800_0000;
+        const TRANSPARENT: u32 = 0x0000_0020;
+        if GetWindowLongW(front, GWL_EXSTYLE) as u32 & (NOACTIVATE | TRANSPARENT) != 0 {
+            return false;
+        }
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(
+            front,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            size_of::<u32>() as u32,
+        );
+        if cloaked != 0 {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(front, &mut rect).is_err() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = MonitorFromWindow(front, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
     }
 }
 
@@ -977,6 +1040,186 @@ fn startup_task() -> Option<windows::ApplicationModel::StartupTask> {
         .ok()
 }
 
+/// A text value from the registry; `None` when it is not there.
+fn registry_text(
+    root: windows::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> Option<String> {
+    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+    let key: Vec<u16> = key.encode_utf16().chain([0]).collect();
+    let value: Vec<u16> = value.encode_utf16().chain([0]).collect();
+    let mut buffer = [0u16; 512];
+    let mut size = (buffer.len() * 2) as u32;
+    unsafe {
+        RegGetValueW(
+            root,
+            windows::core::PCWSTR(key.as_ptr()),
+            windows::core::PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr() as *mut c_void),
+            Some(&mut size),
+        )
+        .ok()
+        .ok()?;
+    }
+    let n = (size as usize / 2).saturating_sub(1).min(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..n]))
+}
+
+/// A number from the registry; `None` when it is not there.
+fn registry_number(
+    root: windows::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> Option<u32> {
+    use windows::Win32::System::Registry::{RRF_RT_REG_DWORD, RegGetValueW};
+    let key: Vec<u16> = key.encode_utf16().chain([0]).collect();
+    let value: Vec<u16> = value.encode_utf16().chain([0]).collect();
+    let mut number = 0u32;
+    let mut size = 4u32;
+    unsafe {
+        RegGetValueW(
+            root,
+            windows::core::PCWSTR(key.as_ptr()),
+            windows::core::PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut number as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+        .ok()
+        .ok()?;
+    }
+    Some(number)
+}
+
+/// The Windows version, as people know it: "Windows 11 24H2 (build 26100.2605)".
+pub fn windows_version() -> String {
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    let key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let build: u32 = registry_text(HKEY_LOCAL_MACHINE, key, "CurrentBuild")
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(0);
+    let update = registry_number(HKEY_LOCAL_MACHINE, key, "UBR").unwrap_or(0);
+    let release = registry_text(HKEY_LOCAL_MACHINE, key, "DisplayVersion").unwrap_or_default();
+    // The product name says "Windows 10" on Windows 11 as well.
+    let name = if build >= 22000 {
+        "Windows 11"
+    } else {
+        "Windows 10"
+    };
+    format!("{name} {release} (build {build}.{update})")
+}
+
+/// The Windows build number.
+pub fn windows_build() -> u32 {
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    registry_text(
+        HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        "CurrentBuild",
+    )
+    .and_then(|b| b.parse().ok())
+    .unwrap_or(0)
+}
+
+/// Whether Windows itself takes the PrintScreen key to open its Snipping
+/// Tool ("Use the Print screen key to open screen capture"). Windows 11 has
+/// it on unless it was turned off; older Windows only when it was turned on.
+pub fn windows_takes_printscreen() -> bool {
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    match registry_number(
+        HKEY_CURRENT_USER,
+        r"Control Panel\Keyboard",
+        "PrintScreenKeyForSnippingEnabled",
+    ) {
+        Some(value) => value != 0,
+        None => windows_build() >= 22621,
+    }
+}
+
+/// Memory in the machine, in bytes.
+pub fn installed_memory() -> u64 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status) }
+        .map(|()| status.ullTotalPhys)
+        .unwrap_or(0)
+}
+
+/// How the machine is powered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Power {
+    Mains,
+    Battery,
+    /// On battery with the battery saver on.
+    Saving,
+}
+
+pub fn power() -> Power {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut status = SYSTEM_POWER_STATUS::default();
+    if unsafe { GetSystemPowerStatus(&mut status) }.is_err() {
+        return Power::Mains;
+    }
+    match (status.ACLineStatus, status.SystemStatusFlag) {
+        (_, 1) => Power::Saving,
+        (0, _) => Power::Battery,
+        _ => Power::Mains,
+    }
+}
+
+/// What Windows says about the window in front, as a number: 1 away, 2 full
+/// screen, 3 Direct3D exclusive full screen, 4 presenting, 5 normal.
+pub fn attention_state() -> i32 {
+    use windows::Win32::UI::Shell::SHQueryUserNotificationState;
+    unsafe { SHQueryUserNotificationState() }.map_or(0, |state| state.0)
+}
+
+/// Whether the program of window `window` runs as administrator.
+pub fn window_is_elevated(window: isize) -> bool {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(HWND(window as *mut c_void), Some(&mut pid)) };
+    pid != 0 && is_elevated(pid)
+}
+
+/// The other Bruma processes running, each with whether it runs as
+/// administrator.
+pub fn other_brumas() -> Vec<(u32, bool)> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let me = unsafe { GetCurrentProcessId() };
+    let mut found = Vec::new();
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return found;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let n = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..n]).to_lowercase();
+            if name == "bruma.exe" && entry.th32ProcessID != me {
+                found.push((entry.th32ProcessID, is_elevated(entry.th32ProcessID)));
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    found
+}
+
 /// Whether Bruma is set to start when you sign in.
 pub fn autostart_enabled() -> bool {
     use windows::ApplicationModel::StartupTaskState;
@@ -1272,8 +1515,11 @@ fn poll_watched_key(down: &mut bool) {
 /// nothing else and goes ahead of other work, so typing never waits for it.
 /// `false` when the hook could not be set.
 pub fn watch_for_hotkey(on_press: impl Fn() + Send + Sync + 'static) -> bool {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+        DispatchMessageW, GetMessageW, HHOOK, KillTimer, MSG, SetTimer, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_TIMER,
     };
     if ON_WATCHED.set(Box::new(on_press)).is_err() {
         return true;
@@ -1283,27 +1529,26 @@ pub fn watch_for_hotkey(on_press: impl Fn() + Send + Sync + 'static) -> bool {
         .name("bruma-keys".into())
         .spawn(move || {
             run_this_thread_first();
-            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             let module = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
-            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
-            if let Err(e) = &hook {
-                eprintln!("bruma: no keyboard hook: {e}");
-            }
-            let _ = told.send(hook.is_ok());
-            if hook.is_err() {
-                return;
-            }
-            // Twice a second: is a program run as administrator in front?
-            // While one is, the key is looked at every 15 ms.
-            use windows::Win32::System::Threading::GetCurrentProcessId;
-            use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_TIMER};
-            // Run as administrator itself, Bruma sees every key anyway.
-            let watch_front = !is_elevated(unsafe { GetCurrentProcessId() });
-            let slow = if watch_front {
-                unsafe { SetTimer(None, 0, 500, None) }
-            } else {
-                0
+            let hook_up =
+                || unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
+            // Once now, to know that it can be done.
+            let mut hook: Option<HHOOK> = match hook_up() {
+                Ok(hook) => Some(hook),
+                Err(e) => {
+                    eprintln!("bruma: no keyboard hook: {e}");
+                    let _ = told.send(false);
+                    return;
+                }
             };
+            let _ = told.send(true);
+            // Twice a second: is the hook needed (a game in front, or
+            // Windows wanting PrintScreen), and is a program run as
+            // administrator in front? While one is, the key is looked at
+            // every 15 ms. Run as administrator itself, Bruma sees every
+            // key anyway.
+            let watch_front = !is_elevated(unsafe { GetCurrentProcessId() });
+            let slow = unsafe { SetTimer(None, 0, 500, None) };
             let mut fast = 0usize;
             let mut front = (0u32, false);
             let mut down = false;
@@ -1312,7 +1557,18 @@ pub fn watch_for_hotkey(on_press: impl Fn() + Send + Sync + 'static) -> bool {
                 while GetMessageW(&mut message, None, 0, 0).as_bool() {
                     if message.message == WM_TIMER && message.hwnd.is_invalid() {
                         if message.wParam.0 == slow {
-                            let elevated = front_is_elevated(&mut front);
+                            let needed = HOOK_ALWAYS.load(std::sync::atomic::Ordering::Relaxed)
+                                || attention() == Attention::FullScreen;
+                            match (&hook, needed) {
+                                (None, true) => hook = hook_up().ok(),
+                                (Some(h), false) => {
+                                    let _ = UnhookWindowsHookEx(*h);
+                                    hook = None;
+                                    WATCHED_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                            let elevated = watch_front && front_is_elevated(&mut front);
                             if elevated && fast == 0 {
                                 fast = SetTimer(None, 0, 15, None);
                             } else if !elevated && fast != 0 {
@@ -1331,6 +1587,16 @@ pub fn watch_for_hotkey(on_press: impl Fn() + Send + Sync + 'static) -> bool {
             }
         });
     spawned.is_ok() && started.recv().unwrap_or(false)
+}
+
+/// Whether the keyboard hook stays on all the time, rather than only while a
+/// game or a film fills the screen: when Windows would otherwise take the
+/// hotkey (PrintScreen for its Snipping Tool).
+static HOOK_ALWAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// See [`HOOK_ALWAYS`].
+pub fn keep_keyboard_hook(always: bool) {
+    HOOK_ALWAYS.store(always, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Sets the key the hook watches for: a virtual-key code and `MOD_*` bits;
@@ -1361,6 +1627,50 @@ pub fn window_centre(window: isize) -> Option<(i32, i32)> {
     let mut rect = RECT::default();
     unsafe { GetWindowRect(HWND(window as *mut c_void), &mut rect) }.ok()?;
     Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+}
+
+/// `path` as Bruma can reach it. A drive letter mapped to a network folder
+/// belongs to the person's ordinary sign-in only: run as administrator,
+/// Bruma does not see it, so the network folder it stands for is used.
+pub fn reachable(path: &std::path::Path) -> std::path::PathBuf {
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    let text = path.to_string_lossy();
+    let mut chars = text.chars();
+    let (Some(letter), Some(':')) = (chars.next(), chars.next()) else {
+        return path.to_path_buf();
+    };
+    if !letter.is_ascii_alphabetic() || std::path::Path::new(&format!("{letter}:\\")).exists() {
+        return path.to_path_buf();
+    }
+    match registry_text(
+        HKEY_CURRENT_USER,
+        &format!(r"Network\{letter}"),
+        "RemotePath",
+    ) {
+        Some(remote) => std::path::PathBuf::from(on_share(&remote, &text[2..])),
+        None => path.to_path_buf(),
+    }
+}
+
+/// `rest` of a path (after its drive letter) on the network folder `remote`.
+fn on_share(remote: &str, rest: &str) -> String {
+    format!(
+        "{}\\{}",
+        remote.trim_end_matches('\\'),
+        rest.trim_start_matches(['\\', '/'])
+    )
+    .trim_end_matches('\\')
+    .to_string()
+}
+
+/// Whether files can be made in `folder` (made first if need be); why not
+/// otherwise.
+pub fn writable_folder(folder: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    let probe = folder.join(format!(".bruma-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// For the trace: what kind of window the one in front is, and where.
@@ -1437,8 +1747,28 @@ pub fn listen_for_settings_requests(on_request: impl Fn() + Send + 'static) -> b
 
 /// The task Windows' Task Scheduler starts Bruma with when it is to run as
 /// administrator. Made once, with the person's consent, it starts Bruma
-/// that way without asking each time.
-const GAMES_TASK: &str = "Bruma";
+/// that way without asking each time. One for each person using the
+/// computer, so that one person's task does not replace another's.
+fn games_task() -> String {
+    let user: String = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !"\\/:*?\"<>|".contains(*c))
+        .collect();
+    if user.is_empty() {
+        "Bruma".into()
+    } else {
+        format!("Bruma - {user}")
+    }
+}
+
+/// The task's name in 0.7.2, one for the whole computer.
+const OLD_GAMES_TASK: &str = "Bruma";
+
+/// The name a task for running as administrator has, for `bruma doctor`.
+pub fn games_task_name() -> String {
+    games_task()
+}
 
 /// Whether this Bruma runs as administrator.
 pub fn running_as_administrator() -> bool {
@@ -1458,12 +1788,24 @@ fn schtasks(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Whether the task that starts Bruma as administrator is there and starts
+/// Whether a task that starts Bruma as administrator is there and starts
 /// `exe`: a task left by a copy elsewhere would start that one, or nothing.
 pub fn games_task_starts(exe: &std::path::Path) -> bool {
+    games_task_for(exe).is_some()
+}
+
+/// The name of the task that starts `exe` as administrator, if there is one.
+fn games_task_for(exe: &std::path::Path) -> Option<String> {
+    [games_task(), OLD_GAMES_TASK.to_string()]
+        .into_iter()
+        .find(|name| task_starts(name, exe))
+}
+
+/// Whether the task `name` is there and starts `exe`.
+fn task_starts(name: &str, exe: &std::path::Path) -> bool {
     use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", GAMES_TASK, "/XML"])
+        .args(["/Query", "/TN", name, "/XML"])
         .creation_flags(0x0800_0000)
         .stderr(std::process::Stdio::null())
         .output()
@@ -1484,7 +1826,10 @@ pub fn games_task_starts(exe: &std::path::Path) -> bool {
 
 /// Starts Bruma as administrator through its task; no question is asked.
 pub fn start_games_task() -> bool {
-    schtasks(&["/Run", "/TN", GAMES_TASK])
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| games_task_for(&exe))
+        .is_some_and(|name| schtasks(&["/Run", "/TN", &name]))
 }
 
 /// Makes the task that starts `exe` as administrator. Needs to run as
@@ -1524,7 +1869,7 @@ pub fn create_games_task(exe: &std::path::Path) -> Result<(), String> {
     bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
     std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
     let file_arg = file.display().to_string();
-    let made = schtasks(&["/Create", "/TN", GAMES_TASK, "/XML", &file_arg, "/F"]);
+    let made = schtasks(&["/Create", "/TN", &games_task(), "/XML", &file_arg, "/F"]);
     let _ = std::fs::remove_file(&file);
     if made {
         Ok(())
@@ -1533,9 +1878,15 @@ pub fn create_games_task(exe: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Removes the task. Needs to run as administrator.
+/// Removes the task, and the one 0.7.2 made if it starts this Bruma. Needs
+/// to run as administrator.
 pub fn delete_games_task() -> bool {
-    schtasks(&["/Delete", "/TN", GAMES_TASK, "/F"])
+    if let Ok(exe) = std::env::current_exe() {
+        if task_starts(OLD_GAMES_TASK, &exe) {
+            schtasks(&["/Delete", "/TN", OLD_GAMES_TASK, "/F"]);
+        }
+    }
+    schtasks(&["/Delete", "/TN", &games_task(), "/F"])
 }
 
 /// Runs this program again as administrator with `args`, after Windows has
@@ -1568,6 +1919,10 @@ pub fn run_as_administrator(args: &str) -> Result<bool, String> {
         let mut code = 1u32;
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
         let _ = CloseHandle(info.hProcess);
+        if code == 2 {
+            return Err("Windows asked for another account. Bruma can run as administrator only                  when your own account is an administrator"
+                .into());
+        }
         Ok(code == 0)
     }
 }
@@ -1955,5 +2310,17 @@ impl Drop for NotifyIcon {
             let _ = DestroyIcon(self.icon);
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_on_a_mapped_drive_becomes_the_network_folder() {
+        assert_eq!(on_share(r"\server\pics", r"\bruma"), r"\server\pics\bruma");
+        assert_eq!(on_share(r"\server\pics\", r"\"), r"\server\pics");
+        assert_eq!(on_share(r"\server\pics", ""), r"\server\pics");
     }
 }

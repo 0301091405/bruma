@@ -110,10 +110,7 @@ impl Tray {
     /// Creates the tray icon and registers `hotkey`, or a fallback if another
     /// program has it.
     pub fn new(proxy: EventLoopProxy<UserEvent>, hotkey: &str) -> Result<Self, String> {
-        let registration = register(hotkey);
-        if let Some(problem) = &registration.problem {
-            eprintln!("bruma: {problem}");
-        }
+        let mut registration = register(hotkey);
         let size = platform::small_icon_size();
         let click_proxy = proxy.clone();
         let icon = NotifyIcon::new(&mark(size), size, "Bruma", move |click| {
@@ -131,6 +128,28 @@ impl Tray {
                 let _ = proxy.send_event(UserEvent::Capture);
             }
         });
+        // Windows 11 gives PrintScreen to its Snipping Tool unless that was
+        // turned off: registering it then fails, or the tool opens as well.
+        // The keyboard hook sees the key before Windows acts on it, so with
+        // the hook Bruma keeps PrintScreen, and no other key is put in its
+        // place.
+        let snipping =
+            platform::windows_takes_printscreen() && virtual_key(hotkey) == Some((0x2C, 0));
+        platform::keep_keyboard_hook(snipping);
+        if watching && snipping && registration.problem.is_some() {
+            if let (Some(manager), Some((fallback, _))) =
+                (&registration.manager, &registration.active)
+            {
+                let _ = manager.unregister(*fallback);
+            }
+            if let Ok(key) = hotkey.parse::<HotKey>() {
+                registration.active = Some((key, hotkey.to_string()));
+                registration.problem = None;
+            }
+        }
+        if let Some(problem) = &registration.problem {
+            eprintln!("bruma: {problem}");
+        }
         if watching {
             platform::set_watched_hotkey(
                 registration

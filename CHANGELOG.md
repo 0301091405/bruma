@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.3 - 2026-11-27
+
+- On Windows 11, where `PrintScreen` opens the Snipping Tool by default, it
+  opens Bruma instead. The Windows setting is left as it is.
+- Games on HDR monitors, and on a computer with a monitor turned on its side,
+  are no longer captured black.
+- The overlays of graphics drivers and chat programs, which cover the screen
+  unseen, no longer make Bruma think a game is running.
+- A game that runs at a lower resolution than the desktop: the overlay is
+  centred once Windows puts the desktop back.
+- Each person on a computer gets their own task for running as administrator,
+  and an account that is not an administrator itself is told so.
+- A save folder on a mapped network drive works while running as
+  administrator.
+- If Bruma stops unexpectedly it leaves a note (`crash.log`, next to the
+  history) and starts again.
+- Rewind and GIF memory grow with 4K and larger screens so the seconds asked
+  for are kept, within a sixteenth of the computer's memory. On battery GIFs
+  are recorded at fifteen pictures a second, and not at all with the battery
+  saver on.
+- The keyboard hook is only in place while a game or a film fills the screen,
+  or while Windows would otherwise take `PrintScreen`.
+- After a game run as administrator could only be copied whole, Bruma says
+  once how to choose an area over such games.
+- `bruma doctor`, and "Copy a report for a bug" in the tray menu.
+
 ## 0.7.2 - 2026-11-27
 
 - `PrintScreen` answers at once on a busy machine. With every core taken by a

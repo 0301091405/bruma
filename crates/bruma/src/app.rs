@@ -43,6 +43,8 @@ pub enum UserEvent {
     GifDone(Result<std::path::PathBuf, String>, bool, u64),
     /// Another process (setup, say) asked Bruma to quit.
     Quit,
+    /// The report for a bug, ready to be copied.
+    Report(String),
     /// The task that starts Bruma as administrator was made (`Ok(true)`), or
     /// not, after Windows asked the person.
     GamesTask(Result<bool, String>),
@@ -139,6 +141,9 @@ struct App {
     /// The full-screen game the overlay opened over, to give it the
     /// keyboard back when the overlay closes.
     back_to: Option<isize>,
+    /// A game run as administrator kept the keyboard (Bruma is not), so only
+    /// the whole screen could be copied: say how to choose an area next time.
+    games_hint: bool,
     menu: Option<TrayMenu>,
     rewind: Option<Rewind>,
     /// Ink, stroke and snap as the last capture left them.
@@ -814,7 +819,9 @@ impl App {
             let asked = std::thread::Builder::new()
                 .name("bruma-games".into())
                 .spawn(move || {
-                    let made = platform::run_as_administrator("games on");
+                    // Who it is for: Windows may ask for another account.
+                    let me = std::env::var("USERNAME").unwrap_or_default();
+                    let made = platform::run_as_administrator(&format!("games on \"{me}\""));
                     let _ = proxy.send_event(UserEvent::GamesTask(made));
                 });
             return match asked {
@@ -915,6 +922,15 @@ impl App {
                 }
             }
             Entry::Settings => self.open_settings(event_loop),
+            Entry::Report => {
+                // Looking at the monitors takes a moment; not on this thread.
+                let proxy = self.proxy.clone();
+                let _ = std::thread::Builder::new()
+                    .name("bruma-report".into())
+                    .spawn(move || {
+                        let _ = proxy.send_event(UserEvent::Report(crate::doctor::report()));
+                    });
+            }
             Entry::Quit => event_loop.exit(),
         }
     }
@@ -1107,6 +1123,14 @@ impl ApplicationHandler<UserEvent> for App {
                     || platform::attention() != platform::Attention::FullScreen
                 {
                     self.open_overlay(event_loop);
+                    if std::mem::take(&mut self.games_hint) {
+                        if let Some(overlay) = self.overlay.as_mut() {
+                            overlay.say(
+                                "That game runs as administrator: turn on \"Work over games \
+                                 run as administrator\" in Settings to choose an area over it",
+                            );
+                        }
+                    }
                 } else {
                     // A game filling the screen: the overlay opens over it
                     // once it has the keyboard (the game steps back, as for
@@ -1120,6 +1144,8 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(_) => {
                             self.drop_overlay();
                             self.capture_over_a_game(event_loop);
+                            self.games_hint = platform::window_is_elevated(game)
+                                && !platform::running_as_administrator();
                         }
                         None => {
                             self.capture_over_a_game(event_loop);
@@ -1137,6 +1163,17 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::TrayMenu(icon) => self.open_menu(event_loop, icon),
             UserEvent::Settings => self.open_settings(event_loop),
             UserEvent::Quit => event_loop.exit(),
+            UserEvent::Report(text) => {
+                let said = match platform::copy_text(&text) {
+                    Ok(()) => "A report is copied: paste it into your bug report. \
+                               It leaves out your name and folders"
+                        .to_string(),
+                    Err(e) => e,
+                };
+                if let Some(scene) = self.scene_now(event_loop) {
+                    self.show_message(event_loop, &scene, Message::Text(said));
+                }
+            }
             UserEvent::GamesTask(made) => self.games_task_made(event_loop, made),
             UserEvent::GifDone(written, save, ms) => {
                 self.gifs = self.gifs.saturating_sub(1);
@@ -1225,6 +1262,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let wake = [
             self.overlay.as_mut().and_then(Overlay::tick),
+            // Over a game, looking again in a moment whether Windows has put
+            // the desktop back to its own size.
+            self.back_to.and(self.overlay.as_ref()).map(|overlay| {
+                overlay.fit_desktop();
+                Instant::now() + Duration::from_millis(250)
+            }),
             self.toast.as_ref().map(Toast::deadline),
             self.stage.as_mut().and_then(Stage::tick),
             self.menu
@@ -1267,6 +1310,7 @@ pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result
         again: None,
         gifs: 0,
         back_to: None,
+        games_hint: false,
         rewind: None,
         prefs: None,
         editing,
