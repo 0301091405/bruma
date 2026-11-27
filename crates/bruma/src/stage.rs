@@ -113,7 +113,11 @@ impl Stage {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_position(PhysicalPosition::new(at.x, at.y))
             .with_inner_size(PhysicalSize::new(w, h))
-            .with_skip_taskbar(true);
+            .with_skip_taskbar(true)
+            // Owned by a window never shown: never on the taskbar, so
+            // showing it does not wait for the taskbar (seconds, on a busy
+            // machine).
+            .with_owner_window(platform::owner_window());
         let window = Rc::new(
             event_loop
                 .create_window(attributes)

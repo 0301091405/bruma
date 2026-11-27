@@ -32,6 +32,10 @@ pub struct Config {
     pub clip: f32,
     /// Copy the moment an area is chosen, without stopping to draw.
     pub quick: bool,
+    /// Run as administrator, through a task made once with consent (setup
+    /// asks), so that the hotkey and the overlay also work over games that
+    /// run that way. Without the task Bruma runs as it is.
+    pub games: bool,
     /// Keep recording for rewind while a game or a film fills the screen.
     /// Off, so that a game never pays for a feature it is not using.
     pub rewind_fullscreen: bool,
@@ -62,6 +66,7 @@ impl Default for Config {
             rewind: 4.0,
             clip: 10.0,
             quick: true,
+            games: true,
             rewind_fullscreen: false,
             fast_capture: true,
             cursor: false,
@@ -136,6 +141,11 @@ impl Config {
                 "quick",
                 self.quick.to_string(),
                 "copy as soon as an area is chosen; Shift keeps it open to draw",
+            ),
+            (
+                "games",
+                self.games.to_string(),
+                "run as administrator, so the hotkey works over games that do",
             ),
             (
                 "rewind_fullscreen",

@@ -37,6 +37,14 @@ pub enum Command {
     Probe,
     /// Ask the running Bruma to show its settings.
     Settings,
+    /// Ask the running Bruma to quit.
+    Quit,
+    /// Make (`true`) or remove the task that starts Bruma as administrator.
+    /// Run as administrator by Bruma itself, after asking.
+    Games(bool),
+    /// Run in the background, started by that task: the Bruma that started
+    /// it is given a moment to quit first.
+    Takeover,
     Version,
 }
 
@@ -68,6 +76,7 @@ USAGE
   bruma find WORDS                     list past captures containing the words
   bruma probe                          time the ways of reading the screen
   bruma settings                       show the settings of the running Bruma
+  bruma quit                           stop the running Bruma
   bruma --help | --version
 
 Without -o, files go to the configured save folder.
@@ -118,6 +127,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("-V" | "--version" | "version") => Ok(Command::Version),
         Some("probe") => Ok(Command::Probe),
         Some("settings") => Ok(Command::Settings),
+        Some("quit") => Ok(Command::Quit),
+        Some("takeover") => Ok(Command::Takeover),
+        Some("games") => match it.next() {
+            Some("on") => Ok(Command::Games(true)),
+            Some("off") => Ok(Command::Games(false)),
+            _ => Err("games takes 'on' or 'off'".into()),
+        },
         Some("lab") => Ok(Command::Lab),
         Some("autostart") => match it.next() {
             None | Some("status") => Ok(Command::Autostart(None)),
@@ -254,6 +270,11 @@ mod tests {
     #[test]
     fn lab_autostart_and_ocr() {
         assert_eq!(parse(&args("lab")), Ok(Command::Lab));
+        assert_eq!(parse(&args("quit")), Ok(Command::Quit));
+        assert_eq!(parse(&args("takeover")), Ok(Command::Takeover));
+        assert_eq!(parse(&args("games on")), Ok(Command::Games(true)));
+        assert_eq!(parse(&args("games off")), Ok(Command::Games(false)));
+        assert!(parse(&args("games")).is_err());
         assert_eq!(parse(&args("autostart")), Ok(Command::Autostart(None)));
         assert_eq!(
             parse(&args("autostart on")),

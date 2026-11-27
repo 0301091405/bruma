@@ -19,6 +19,7 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::overlay::blit;
+use crate::platform;
 
 /// How long a short message stays up.
 pub const BRIEF: Duration = Duration::from_millis(1400);
@@ -72,7 +73,11 @@ impl Toast {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_position(PhysicalPosition::new(at.0, at.1))
             .with_inner_size(size)
-            .with_skip_taskbar(true);
+            .with_skip_taskbar(true)
+            // Owned by a window never shown: never on the taskbar, so
+            // showing it does not wait for the taskbar (seconds, on a busy
+            // machine).
+            .with_owner_window(platform::owner_window());
         let window = Rc::new(
             event_loop
                 .create_window(attributes)

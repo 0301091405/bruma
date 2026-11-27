@@ -41,6 +41,11 @@ pub enum UserEvent {
     /// A GIF has been written (or not), from this many milliseconds of
     /// recording; `true` if it was only to be saved.
     GifDone(Result<std::path::PathBuf, String>, bool, u64),
+    /// Another process (setup, say) asked Bruma to quit.
+    Quit,
+    /// The task that starts Bruma as administrator was made (`Ok(true)`), or
+    /// not, after Windows asked the person.
+    GamesTask(Result<bool, String>),
 }
 
 /// Where the source code is.
@@ -131,6 +136,9 @@ struct App {
     again: Option<Snapshot>,
     /// GIFs being written in the background.
     gifs: usize,
+    /// The full-screen game the overlay opened over, to give it the
+    /// keyboard back when the overlay closes.
+    back_to: Option<isize>,
     menu: Option<TrayMenu>,
     rewind: Option<Rewind>,
     /// Ink, stroke and snap as the last capture left them.
@@ -303,6 +311,9 @@ impl App {
                             std::thread::Builder::new()
                                 .name("bruma-gif".into())
                                 .spawn(move || {
+                                    // Cheap rather than quick: the band
+                                    // threads go ahead of a game.
+                                    bruma_core::par::keep_jobs_on_this_thread();
                                     let fonts = Fonts::system();
                                     let written = clip
                                         .gif(from, to, |picture| {
@@ -397,17 +408,10 @@ impl App {
                     }
                 }
                 Effect::Close => {
-                    // Remember ink, stroke and snap for the next capture.
-                    if let Some(overlay) = self.overlay.take() {
-                        self.prefs = Some(overlay.prefs());
-                        if self.background {
-                            // Keep the window; the next capture opens sooner.
-                            self.shell = Some(overlay.into_shell());
-                        }
-                    }
-                    crate::flush_trace();
-                    if let Some(rewind) = &self.rewind {
-                        rewind.resume();
+                    self.drop_overlay();
+                    // Back to the game the overlay opened over.
+                    if let Some(game) = self.back_to.take() {
+                        platform::give_back(game);
                     }
                 }
             }
@@ -474,6 +478,107 @@ impl App {
         })
     }
 
+    /// Closes the overlay, keeping what it learnt for the next capture.
+    fn drop_overlay(&mut self) {
+        // Remember ink, stroke and snap for the next capture.
+        if let Some(overlay) = self.overlay.take() {
+            self.prefs = Some(overlay.prefs());
+            if self.background {
+                // Keep the window; the next capture opens sooner.
+                self.shell = Some(overlay.into_shell());
+            }
+        }
+        crate::flush_trace();
+        if let Some(rewind) = &self.rewind {
+            rewind.resume();
+        }
+    }
+
+    /// With a game or a film filling the screen, copies that monitor at once
+    /// and shows the card instead of opening the overlay over it. The game
+    /// keeps the keyboard (Windows does not let Bruma take it from a game
+    /// run as administrator), nothing has to be clicked away, and a click
+    /// on the card opens the capture to draw on. `false` when the screen
+    /// could not be read.
+    fn capture_over_a_game(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let started = Instant::now();
+        let (screen, origin) = match self.rewind.as_ref().and_then(Rewind::shot) {
+            Some(shot) => (shot.image, shot.origin),
+            None => match platform::capture() {
+                Ok(capture) => (std::sync::Arc::new(capture.image), capture.origin),
+                Err(e) => {
+                    eprintln!("bruma: {e}");
+                    return false;
+                }
+            },
+        };
+        let local = |m: &winit::monitor::MonitorHandle| {
+            let (at, size) = (m.position(), m.size());
+            bruma_core::Rect::new(
+                (at.x - origin.0) as f32,
+                (at.y - origin.1) as f32,
+                size.width as f32,
+                size.height as f32,
+            )
+            .intersect(&screen.bounds())
+        };
+        // The monitor the game is on: the one under the middle of its window.
+        let (x, y) = platform::window_centre(platform::foreground_window())
+            .or_else(platform::cursor_position)
+            .unwrap_or((0, 0));
+        let Some(monitor) = event_loop
+            .available_monitors()
+            .find(|m| {
+                let (p, s) = (m.position(), m.size());
+                x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+            })
+            .or_else(|| event_loop.primary_monitor())
+        else {
+            return false;
+        };
+        let area = local(&monitor);
+        if area.is_empty() {
+            return false;
+        }
+        let image = screen.crop(area);
+        crate::trace("capture over a game", started);
+        let caption = match platform::copy_image(&image) {
+            Ok(()) => {
+                // A game may not let the card show over it: this says the
+                // capture was taken.
+                platform::play_shutter();
+                format!("Copied {} \u{00D7} {}", image.width, image.height)
+            }
+            Err(e) => e,
+        };
+        if self.config.autosave {
+            self.save(&image, None, None);
+        }
+        self.remember(&image);
+        let scale = monitor.scale_factor() as f32;
+        self.again = Some(Snapshot {
+            screen: screen.clone(),
+            origin,
+            windows: platform::windows_and_panes()
+                .0
+                .into_iter()
+                .map(|r| r.translate(-origin.0 as f32, -origin.1 as f32))
+                .collect(),
+            monitors: event_loop.available_monitors().map(|m| local(&m)).collect(),
+            selection: area,
+            scale,
+        });
+        let scene = Scene {
+            screen,
+            origin,
+            monitor: area,
+            scale,
+            selection: Some(area),
+        };
+        self.show_message(event_loop, &scene, Message::Shot(caption, image));
+        true
+    }
+
     fn hello(&mut self, event_loop: &ActiveEventLoop) {
         let Some(scene) = self.scene_now(event_loop) else {
             return;
@@ -511,6 +616,10 @@ impl App {
             folder: self.config.save_dir().display().to_string(),
             history: self.config.history,
             autostart: platform::autostart_enabled(),
+            // On only when it is so: as administrator, or with the task there.
+            games: self.config.games
+                && (platform::running_as_administrator()
+                    || std::env::current_exe().is_ok_and(|exe| platform::games_task_starts(&exe))),
         }
     }
 
@@ -632,6 +741,13 @@ impl App {
         if values.cursor != self.config.cursor {
             platform::set_capture_cursor(values.cursor);
         }
+        if values.games != self.config.games {
+            let (games, said) = self.switch_games(values.games);
+            values.games = games;
+            if said.is_some() {
+                problem = said;
+            }
+        }
         let rewind_changed = values.rewind != self.config.rewind || values.clip != self.config.clip;
         self.config.quick = values.quick;
         self.config.clip = values.clip;
@@ -662,6 +778,82 @@ impl App {
         if let Some(form) = self.stage.as_mut().and_then(Stage::form) {
             form.values = values;
             form.set_message(problem);
+        }
+        if let Some(stage) = &self.stage {
+            stage.redraw();
+        }
+    }
+
+    /// Turns running as administrator on or off, as far as can be done at
+    /// once. Returns what the switch should show and what to tell.
+    ///
+    /// On, Windows first asks the person; a Bruma run as administrator then
+    /// makes the task that starts it that way, and this one makes way for
+    /// it (see [`App::games_task_made`]). Off, Bruma starts without the task
+    /// from then on; the one running keeps its rights until it quits.
+    fn switch_games(&mut self, on: bool) -> (bool, Option<String>) {
+        if on {
+            if platform::running_as_administrator() {
+                let made = std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|exe| platform::create_games_task(&exe));
+                return match made {
+                    Ok(()) => {
+                        self.config.games = true;
+                        (true, None)
+                    }
+                    Err(why) => (false, Some(why)),
+                };
+            }
+            // The task is there already (made by setup): no need to ask.
+            if std::env::current_exe().is_ok_and(|exe| platform::games_task_starts(&exe)) {
+                let _ = self.proxy.send_event(UserEvent::GamesTask(Ok(true)));
+                return (true, None);
+            }
+            let proxy = self.proxy.clone();
+            let asked = std::thread::Builder::new()
+                .name("bruma-games".into())
+                .spawn(move || {
+                    let made = platform::run_as_administrator("games on");
+                    let _ = proxy.send_event(UserEvent::GamesTask(made));
+                });
+            return match asked {
+                Ok(_) => (true, Some("Windows asks for permission once".into())),
+                Err(e) => (false, Some(e.to_string())),
+            };
+        }
+        self.config.games = false;
+        if platform::running_as_administrator() {
+            platform::delete_games_task();
+            return (
+                false,
+                Some("Without administrator rights from the next start".into()),
+            );
+        }
+        (false, None)
+    }
+
+    /// After Windows asked: with the task made, Bruma starts again through
+    /// it, as administrator, and this one quits.
+    fn games_task_made(&mut self, event_loop: &ActiveEventLoop, made: Result<bool, String>) {
+        let problem = match made {
+            Ok(true) => {
+                self.config.games = true;
+                match self.config.save() {
+                    Ok(_) if platform::start_games_task() => {
+                        event_loop.exit();
+                        return;
+                    }
+                    Ok(_) => "The task was made but did not start; restart Bruma".to_string(),
+                    Err(why) => why,
+                }
+            }
+            Ok(false) => "Windows could not make the task".to_string(),
+            Err(why) => why,
+        };
+        if let Some(form) = self.stage.as_mut().and_then(Stage::form) {
+            form.values.games = self.config.games;
+            form.set_message(Some(problem));
         }
         if let Some(stage) = &self.stage {
             stage.redraw();
@@ -860,6 +1052,10 @@ impl ApplicationHandler<UserEvent> for App {
             platform::listen_for_settings_requests(move || {
                 let _ = proxy.send_event(UserEvent::Settings);
             });
+            let proxy = self.proxy.clone();
+            platform::listen_for_quit_requests(move || {
+                let _ = proxy.send_event(UserEvent::Quit);
+            });
             match Tray::new(self.proxy.clone(), &self.config.hotkey) {
                 Ok(tray) => {
                     self.tray = Some(tray);
@@ -894,11 +1090,54 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Capture => {
+                crate::note(|| {
+                    format!(
+                        "capture asked: {:?}, overlay open {}, in front: {}",
+                        platform::attention(),
+                        self.overlay.is_some(),
+                        platform::describe_window(platform::foreground_window())
+                    )
+                });
                 self.menu = None;
-                self.open_overlay(event_loop);
+                // Already open (perhaps behind a window that pushed in
+                // front): bring it back rather than doing nothing.
+                if let Some(overlay) = &self.overlay {
+                    overlay.raise();
+                } else if self.stage.is_some()
+                    || platform::attention() != platform::Attention::FullScreen
+                {
+                    self.open_overlay(event_loop);
+                } else {
+                    // A game filling the screen: the overlay opens over it
+                    // once it has the keyboard (the game steps back, as for
+                    // Alt+Tab), and the game gets it back afterwards. When
+                    // Windows keeps the keyboard with the game, nothing can
+                    // show over it: the screen is copied as it is.
+                    let game = platform::foreground_window();
+                    self.open_overlay(event_loop);
+                    match &self.overlay {
+                        Some(overlay) if overlay.has_keyboard() => self.back_to = Some(game),
+                        Some(_) => {
+                            self.drop_overlay();
+                            self.capture_over_a_game(event_loop);
+                        }
+                        None => {
+                            self.capture_over_a_game(event_loop);
+                        }
+                    }
+                }
+                crate::note(|| {
+                    format!(
+                        "after opening, in front: {}",
+                        platform::describe_window(platform::foreground_window())
+                    )
+                });
+                crate::flush_trace();
             }
             UserEvent::TrayMenu(icon) => self.open_menu(event_loop, icon),
             UserEvent::Settings => self.open_settings(event_loop),
+            UserEvent::Quit => event_loop.exit(),
+            UserEvent::GamesTask(made) => self.games_task_made(event_loop, made),
             UserEvent::GifDone(written, save, ms) => {
                 self.gifs = self.gifs.saturating_sub(1);
                 let seconds = ms as f32 / 1000.0;
@@ -1004,6 +1243,11 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// Runs until quit (background) or until the capture and its pins are closed.
 pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result<(), String> {
+    // The hotkey arrives on this thread, and the picture is taken and shown
+    // from it: on a machine kept busy by a game it must still go first.
+    // Helpers it waits for go at the same priority.
+    platform::run_this_thread_first();
+    bruma_core::par::on_new_worker(platform::put_first);
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| e.to_string())?;
@@ -1022,6 +1266,7 @@ pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result
         menu: None,
         again: None,
         gifs: 0,
+        back_to: None,
         rewind: None,
         prefs: None,
         editing,

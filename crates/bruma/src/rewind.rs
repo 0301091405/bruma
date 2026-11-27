@@ -50,6 +50,9 @@ const SETTLE: Duration = Duration::from_millis(400);
 const BUDGET_BYTES: usize = 192 * 1024 * 1024;
 /// How long a capture waits for the recorder before reading the screen itself.
 const ANSWER_WITHIN: Duration = Duration::from_millis(80);
+/// How long a capture waits for the recorder while something fills the
+/// screen: setting duplication up was seen to take up to half a second.
+const ANSWER_OVER_A_GAME: Duration = Duration::from_millis(1500);
 /// A desktop that declined duplication is asked again after this long.
 const ASK_AGAIN: Duration = Duration::from_secs(30);
 
@@ -283,6 +286,23 @@ impl Eyes {
         Some((raw, false))
     }
 
+    /// For a capture right after duplication was set up: waits up to `ms`
+    /// for a picture that was really drawn, the first one handed over being
+    /// possibly empty. Without one, duplication is dropped and the screen is
+    /// read the slow way.
+    fn settle(&mut self, ms: u64) {
+        let Some(duplicator) = self.duplicator.as_mut() else {
+            return;
+        };
+        match duplicator.wait_until_drawn(ms) {
+            Ok(true) => self.unseen = true,
+            outcome => {
+                note(|| format!("rewind: no picture drawn in time ({outcome:?})"));
+                self.duplicator = None;
+            }
+        }
+    }
+
     /// Lets go of everything; `true` if there was anything to let go of.
     fn rest(&mut self) -> bool {
         self.duplicator.take().is_some() | self.grabber.take().is_some()
@@ -341,11 +361,22 @@ impl Recorder<'_> {
         let started = Instant::now();
         let window = self.shared.window;
         let plain = attention == Attention::Desktop && !platform::captures_cursor();
-        // Setting duplication up takes a moment a waiting capture does not have.
-        if !urgent || !(self.eyes.fast && plain) {
+        // A game or a film filling the screen is often drawn where only
+        // duplication sees it: the slow way gives black or an old picture.
+        // So a capture then sets duplication up, though it takes a moment;
+        // the recorder lets go of it again when it next rests.
+        let game = urgent && attention == Attention::FullScreen && !platform::captures_cursor();
+        // Otherwise setting duplication up takes a moment a waiting capture
+        // does not have.
+        if game {
+            self.eyes.get_ready(true);
+        } else if !urgent || !(self.eyes.fast && plain) {
             self.eyes.get_ready(plain);
         }
         self.refresh(started);
+        if game {
+            self.eyes.settle(400);
+        }
         let Some((raw, same)) = self.eyes.look() else {
             self.in_step = false;
             return None;
@@ -501,6 +532,17 @@ fn run(shared: &Shared, requests: mpsc::Receiver<Request>, in_fullscreen: bool, 
             if recorder.eyes.rest() {
                 note(|| format!("rewind: resting ({attention:?})"));
             }
+            // The past seconds are of no use under a game, and their memory
+            // (a few hundred megabytes with GIFs on) is the game's to use.
+            // Recording starts afresh when the game is left.
+            if let Ok(mut frames) = shared.frames.lock() {
+                if !frames.is_empty() {
+                    *frames = VecDeque::new();
+                }
+            }
+            if let Ok(mut tape) = shared.tape.lock() {
+                *tape = None;
+            }
             recorder.in_step = false;
         } else if records {
             recorder.sample(attention, false);
@@ -559,7 +601,14 @@ impl Rewind {
         // behind whatever else is busy.
         platform::hurry(&self.thread);
         self.requests.send(reply).ok()?;
-        answer.recv_timeout(ANSWER_WITHIN).ok().flatten()
+        // Over a game the recorder first sets duplication up, and nothing
+        // else sees the game: worth waiting for.
+        let within = if platform::attention() == Attention::FullScreen {
+            ANSWER_OVER_A_GAME
+        } else {
+            ANSWER_WITHIN
+        };
+        answer.recv_timeout(within).ok().flatten()
     }
 
     /// Stops sampling while an overlay is on screen.

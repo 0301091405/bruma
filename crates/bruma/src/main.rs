@@ -328,7 +328,59 @@ fn main() -> ExitCode {
             }
         }
         Command::Capture => app::run(false, config, None),
+        Command::Takeover => {
+            // The Bruma that started the task may take a moment to quit.
+            let mut lock = None;
+            for _ in 0..50 {
+                lock = platform::SingleInstance::acquire();
+                if lock.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            match lock {
+                Some(_lock) => app::run(true, config, None),
+                None => Err("already running in the background (look for the tray icon)".into()),
+            }
+        }
+        Command::Quit => {
+            if platform::request_quit() {
+                // Done when it has let go of being the one in the background.
+                for _ in 0..50 {
+                    if platform::SingleInstance::acquire().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            Ok(())
+        }
+        Command::Games(true) => std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| platform::create_games_task(&exe)),
+        Command::Games(false) => {
+            platform::delete_games_task();
+            Ok(())
+        }
         Command::Background => match platform::SingleInstance::acquire() {
+            // Set to run as administrator: the task starts that Bruma, and
+            // this one makes way for it.
+            Some(lock)
+                if config.games
+                    && !platform::running_as_administrator()
+                    && std::env::current_exe()
+                        .is_ok_and(|exe| platform::games_task_starts(&exe)) =>
+            {
+                drop(lock);
+                if platform::start_games_task() {
+                    Ok(())
+                } else {
+                    match platform::SingleInstance::acquire() {
+                        Some(_lock) => app::run(true, config, None),
+                        None => Ok(()),
+                    }
+                }
+            }
             Some(_lock) => app::run(true, config, None),
             // Already running. Starting it again, from the Start menu say,
             // is someone asking for it: open a capture.

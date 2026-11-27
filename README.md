@@ -20,7 +20,12 @@ One executable of about 2 MB. No network access. Windows 10 and 11.
 ## Install
 
 Download [bruma-setup.exe](https://github.com/0301091405/bruma/releases/latest/download/bruma-setup.exe)
-and run it. It doesn't need administrator rights. Bruma then waits in the tray.
+and run it. At the end Windows asks once whether Bruma may run as
+administrator. Many games run that way (anti-cheat often starts them so), and
+Windows keeps their keys from programs that don't, so this is what lets
+`PrintScreen` work in them. Say no and Bruma runs as an ordinary program,
+which works everywhere but in those games; "Work over games run as
+administrator" in Settings asks again. Bruma then waits in the tray.
 
 Or paste this into PowerShell:
 
@@ -47,6 +52,10 @@ The files aren't signed, so SmartScreen may warn you. Choose "More info", then
   Trim it, draw on it, and `Enter` copies it as a file.
 - **Draw.** Arrows, boxes, text, numbered steps, blur and more, right on the
   screen. There is no separate editor.
+- **Games.** `PrintScreen` works in full-screen games too. The game steps
+  back while you choose, as it would for `Alt+Tab`, and you're returned to it
+  afterwards. If Windows won't let anything show over the game, the whole
+  screen is copied and a shutter sound says so.
 - **Private text.** `M` blurs e-mail addresses, card numbers, passwords and
   the like. `X` copies the text. It uses the text recognition built into
   Windows and can miss things, so check before you send.
@@ -89,9 +98,14 @@ No network code, no telemetry, no update check. Captures go to your clipboard,
 your disk and a local history folder, nowhere else.
 
 While Bruma runs it keeps a short recording of the screen in memory for rewind
-and GIFs. It reads only what changes, uses about 1% of one core when the screen
-is busy, and pauses during full-screen games and films. Setting `rewind = 0`
+and GIFs. It reads only what changes and uses a few percent of one core while
+something on screen keeps moving. While a game or a film fills the screen it
+stops and gives that memory back. Setting `rewind = 0`
 and `clip = 0` in the settings file turns it off.
+
+Running as administrator means anything Bruma starts runs that way too,
+including a command set in `run_after`. Turn it off in Settings if you'd
+rather not.
 
 ## Building
 

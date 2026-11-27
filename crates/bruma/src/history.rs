@@ -103,6 +103,7 @@ pub fn record(image: Image, keep: usize, now: LocalTime) {
     let _ = std::thread::Builder::new()
         .name("bruma-history".into())
         .spawn(move || {
+            bruma_core::par::keep_jobs_on_this_thread();
             if std::fs::create_dir_all(&dir).is_err() {
                 return;
             }

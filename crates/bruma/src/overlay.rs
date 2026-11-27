@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bruma_core::clip::{Clip, Cursor};
 use bruma_core::doc::Annotation;
-use bruma_core::render::Renderer;
+use bruma_core::render::{Layers, Renderer};
 use bruma_core::session::{Effect, Frame, Input, Key, Mods, Options, Prefs, Session};
 use bruma_core::text::Fonts;
 use bruma_core::tiny_skia::Pixmap;
@@ -103,7 +103,11 @@ impl Shell {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_position(PhysicalPosition::new(origin.0, origin.1))
             .with_inner_size(size)
-            .with_skip_taskbar(true);
+            .with_skip_taskbar(true)
+            // Owned by a window never shown: never on the taskbar, so
+            // showing it does not wait for the taskbar (seconds, on a busy
+            // machine).
+            .with_owner_window(platform::owner_window());
         let window = Rc::new(
             event_loop
                 .create_window(attributes)
@@ -162,6 +166,8 @@ impl Overlay {
         // The recorder, when it runs, has the screen sooner than a capture
         // made from scratch.
         let shot = rewind.filter(|_| from_recorder).and_then(Rewind::shot);
+        trace("  from the recorder", started);
+        note(|| format!("  the recorder had it: {}", shot.is_some()));
         let (image, origin) = match shot {
             Some(shot) => (shot.image, shot.origin),
             None => {
@@ -229,11 +235,40 @@ impl Overlay {
         // Build the dimmed screen and the glass on another core while the
         // window is being made.
         let (newest, index) = (session.present(), session.frame_index());
+        let layers = Self::prepare_layers(newest, index, scale);
+        Self::show(event_loop, session, origin, size, started, layers, shell)
+    }
+
+    /// Builds the dimmed screen and the glass on another core, at the
+    /// priority of the thread that waits for them.
+    fn prepare_layers(
+        newest: std::sync::Arc<Image>,
+        index: usize,
+        scale: f32,
+    ) -> Option<std::thread::JoinHandle<Layers>> {
         let layers = std::thread::Builder::new()
             .name("bruma-layers".into())
             .spawn(move || Renderer::prepare(&newest, index, scale))
-            .ok();
-        Self::show(event_loop, session, origin, size, started, layers, shell)
+            .ok()?;
+        platform::set_thread_priority(&layers, platform::this_thread_priority());
+        Some(layers)
+    }
+
+    /// Whether the overlay has the keyboard, so that it is on screen even
+    /// over a full-screen game.
+    pub fn has_keyboard(&self) -> bool {
+        window_handle(&self.window).is_some_and(|h| platform::foreground_window() == h)
+    }
+
+    /// Brings the overlay back to the front and gives it the keyboard, for
+    /// when the hotkey is pressed while it is open.
+    pub fn raise(&self) {
+        self.window.set_window_level(WindowLevel::AlwaysOnTop);
+        if let Some(handle) = window_handle(&self.window) {
+            platform::show_without_activating(handle);
+            platform::force_forward(handle);
+        }
+        self.window.request_redraw();
     }
 
     fn options(config: &Config, prefs: Option<Prefs>, scale: f32, quick: bool) -> Options {
@@ -273,10 +308,7 @@ impl Overlay {
         );
         session.select(snapshot.selection);
         let (newest, index) = (session.present(), session.frame_index());
-        let layers = std::thread::Builder::new()
-            .name("bruma-layers".into())
-            .spawn(move || Renderer::prepare(&newest, index, scale))
-            .ok();
+        let layers = Self::prepare_layers(newest, index, scale);
         Self::show(
             event_loop,
             session,
@@ -490,6 +522,7 @@ impl Overlay {
         // keyboard from the window in front can wait those few milliseconds.
         let step = Instant::now();
         overlay.window.set_cursor(CursorIcon::Crosshair);
+        trace("  cursor", step);
         if let Some(handle) = window_handle(&overlay.window) {
             platform::show_without_activating(handle);
         }
@@ -498,7 +531,11 @@ impl Overlay {
         trace("hotkey to first frame", started);
         let step = Instant::now();
         overlay.window.set_visible(true);
-        overlay.window.focus_window();
+        // Without winit's trick (a pretend Alt key, which a game in front
+        // would see as the player's).
+        if let Some(handle) = window_handle(&overlay.window) {
+            platform::force_forward(handle);
+        }
         trace("  focus", step);
         // Now that there is a picture, find out what is under the pointer.
         let step = Instant::now();

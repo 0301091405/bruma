@@ -123,11 +123,34 @@ impl Tray {
             };
             let _ = click_proxy.send_event(event);
         })?;
-        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-            if event.state() == HotKeyState::Pressed {
+        // The keyboard hook, for games that hold back registered hotkeys;
+        // the registration still keeps the key from other programs.
+        let watcher = std::sync::Mutex::new(proxy.clone());
+        let watching = platform::watch_for_hotkey(move || {
+            if let Ok(proxy) = watcher.lock() {
                 let _ = proxy.send_event(UserEvent::Capture);
             }
-        }));
+        });
+        if watching {
+            platform::set_watched_hotkey(
+                registration
+                    .active
+                    .as_ref()
+                    .and_then(|(_, name)| virtual_key(name)),
+            );
+        }
+        // The hotkey goes straight to the event loop. Should that not be
+        // possible, the library's own way still works.
+        let direct = proxy.clone();
+        if !platform::answer_hotkeys_directly(move || {
+            let _ = direct.send_event(UserEvent::Capture);
+        }) {
+            GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+                if event.state() == HotKeyState::Pressed {
+                    let _ = proxy.send_event(UserEvent::Capture);
+                }
+            }));
+        }
 
         Ok(Self {
             _icon: icon,
@@ -152,6 +175,7 @@ impl Tray {
         if let (Some(manager), Some((key, _))) = (&self.manager, &self.registered) {
             let _ = manager.unregister(*key);
         }
+        platform::set_watched_hotkey(None);
         self.paused = true;
     }
 
@@ -163,6 +187,7 @@ impl Tray {
         if let (Some(manager), Some((key, _))) = (&self.manager, &self.registered) {
             let _ = manager.register(*key);
         }
+        platform::set_watched_hotkey(self.registered.as_ref().and_then(|(_, n)| virtual_key(n)));
         self.paused = false;
     }
 
@@ -183,16 +208,98 @@ impl Tray {
             Ok(()) => {
                 self.registered = Some((parsed, wanted.to_string()));
                 self.problem = None;
+                platform::set_watched_hotkey(virtual_key(wanted));
                 Ok(())
             }
             Err(_) => {
                 if let Some((old, _)) = &self.registered {
                     let _ = manager.register(*old);
                 }
+                platform::set_watched_hotkey(
+                    self.registered.as_ref().and_then(|(_, n)| virtual_key(n)),
+                );
                 Err(format!("{} is taken by another app", pretty(wanted)))
             }
         }
     }
+}
+
+/// The virtual-key code and modifier bits of a hotkey written the way the
+/// settings write it ("ctrl+shift+KeyS", "PrintScreen"), for the keyboard
+/// hook. `None` for a key it does not know; the registered hotkey then
+/// works alone.
+fn virtual_key(name: &str) -> Option<(u16, u32)> {
+    let mut mods = 0;
+    let mut key = None;
+    for part in name.split('+').map(str::trim) {
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods |= platform::MOD_CTRL,
+            "shift" => mods |= platform::MOD_SHIFT,
+            "alt" | "option" => mods |= platform::MOD_ALT,
+            "super" | "win" | "meta" | "cmd" | "command" => mods |= platform::MOD_WIN,
+            _ => key = Some(part),
+        }
+    }
+    let key = key?;
+    let lower = key.to_ascii_lowercase();
+    // "KeyS" and "Digit4": the virtual-key code is the character's own.
+    let single = |rest: &str| {
+        let mut chars = rest.chars();
+        let c = chars.next()?.to_ascii_uppercase();
+        chars.next().is_none().then_some(c)
+    };
+    let vk = if let Some(rest) = key.strip_prefix("Key") {
+        single(rest).filter(char::is_ascii_uppercase)? as u16
+    } else if let Some(rest) = key.strip_prefix("Digit") {
+        single(rest).filter(char::is_ascii_digit)? as u16
+    } else if let Some(n) = key
+        .strip_prefix('F')
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| (1..=24).contains(n))
+    {
+        0x6F + n
+    } else if let Some(n) = key
+        .strip_prefix("Numpad")
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| *n <= 9)
+    {
+        0x60 + n
+    } else {
+        match lower.as_str() {
+            "printscreen" => 0x2C,
+            "pause" => 0x13,
+            "scrolllock" => 0x91,
+            "insert" => 0x2D,
+            "delete" => 0x2E,
+            "home" => 0x24,
+            "end" => 0x23,
+            "pageup" => 0x21,
+            "pagedown" => 0x22,
+            "arrowleft" => 0x25,
+            "arrowup" => 0x26,
+            "arrowright" => 0x27,
+            "arrowdown" => 0x28,
+            "space" => 0x20,
+            "backquote" => 0xC0,
+            "minus" => 0xBD,
+            "equal" => 0xBB,
+            "bracketleft" => 0xDB,
+            "bracketright" => 0xDD,
+            "backslash" => 0xDC,
+            "semicolon" => 0xBA,
+            "quote" => 0xDE,
+            "comma" => 0xBC,
+            "period" => 0xBE,
+            "slash" => 0xBF,
+            "numpadmultiply" => 0x6A,
+            "numpadadd" => 0x6B,
+            "numpadsubtract" => 0x6D,
+            "numpaddecimal" => 0x6E,
+            "numpaddivide" => 0x6F,
+            _ => return None,
+        }
+    };
+    Some((vk, mods))
 }
 
 /// Tried in order when the configured hotkey belongs to another program.
@@ -286,6 +393,32 @@ mod tests {
             &rgba[centre..centre + 4],
             &[ACCENT[0], ACCENT[1], ACCENT[2], 255]
         );
+    }
+
+    #[test]
+    fn hotkeys_become_the_keys_the_keyboard_hook_watches_for() {
+        use platform::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_WIN};
+        assert_eq!(virtual_key("PrintScreen"), Some((0x2C, 0)));
+        assert_eq!(virtual_key("ctrl+PrintScreen"), Some((0x2C, MOD_CTRL)));
+        assert_eq!(
+            virtual_key("ctrl+alt+KeyB"),
+            Some((0x42, MOD_CTRL | MOD_ALT))
+        );
+        assert_eq!(
+            virtual_key("ctrl+shift+KeyS"),
+            Some((0x53, MOD_CTRL | MOD_SHIFT))
+        );
+        assert_eq!(virtual_key("shift+Digit4"), Some((0x34, MOD_SHIFT)));
+        assert_eq!(virtual_key("super+F12"), Some((0x7B, MOD_WIN)));
+        assert_eq!(virtual_key("F1"), Some((0x70, 0)));
+        assert_eq!(virtual_key("alt+Numpad7"), Some((0x67, MOD_ALT)));
+        assert_eq!(virtual_key("Pause"), Some((0x13, 0)));
+        assert_eq!(virtual_key("ctrl+KeyAB"), None);
+        assert_eq!(virtual_key("ctrl+F25"), None);
+        assert_eq!(virtual_key("ctrl+shift"), None);
+        for name in FALLBACK_HOTKEYS {
+            assert!(virtual_key(name).is_some(), "{name}");
+        }
     }
 
     #[test]

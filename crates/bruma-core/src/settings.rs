@@ -42,6 +42,8 @@ pub struct Values {
     /// Captures kept; 0 is off.
     pub history: usize,
     pub autostart: bool,
+    /// Run as administrator, so the hotkey works over games that do.
+    pub games: bool,
 }
 
 /// Everything on the panel that can be pointed at.
@@ -58,6 +60,7 @@ pub enum Item {
     Folder,
     History,
     Autostart,
+    Games,
     EditFile,
     Source,
     Close,
@@ -107,7 +110,13 @@ const SECTIONS: &[(&str, &[(Item, &str)])] = &[
             (Item::History, "History"),
         ],
     ),
-    ("BRUMA", &[(Item::Autostart, "Start with Windows")]),
+    (
+        "BRUMA",
+        &[
+            (Item::Autostart, "Start with Windows"),
+            (Item::Games, "Work over games run as administrator"),
+        ],
+    ),
 ];
 
 /// The steps a stepper moves through.
@@ -425,6 +434,7 @@ impl Form {
             Item::Cursor => v.cursor = up,
             Item::Autosave => v.autosave = up,
             Item::Autostart => v.autostart = up,
+            Item::Games => v.games = up,
             _ => {}
         }
         if *v == before {
@@ -446,6 +456,7 @@ impl Form {
                     Item::Cursor => self.values.cursor,
                     Item::Autosave => self.values.autosave,
                     Item::Autostart => self.values.autostart,
+                    Item::Games => self.values.games,
                     _ => false,
                 };
                 self.adjust(item, !on)
@@ -617,6 +628,7 @@ impl Form {
                         Item::Cursor => self.values.cursor,
                         Item::Autosave => self.values.autosave,
                         Item::Autostart => self.values.autostart,
+                        Item::Games => self.values.games,
                         _ => false,
                     };
                     switch(pixmap, row.control, on, self.scale);
@@ -871,6 +883,7 @@ mod tests {
             folder: "C:\\Pictures\\bruma".into(),
             history: 200,
             autostart: true,
+            games: false,
         }
     }
 

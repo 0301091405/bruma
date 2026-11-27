@@ -23,6 +23,7 @@ pub mod render;
 pub mod session;
 pub mod settings;
 pub mod snap;
+pub mod sound;
 pub mod stitch;
 pub mod strip;
 pub mod text;

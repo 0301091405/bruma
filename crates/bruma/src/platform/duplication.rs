@@ -50,6 +50,9 @@ struct Output {
     size: (usize, usize),
     /// Whether its picture has arrived at least once.
     seen: bool,
+    /// Whether a picture that was really drawn has arrived. The first one
+    /// handed over can be empty (black) until the screen is next drawn.
+    drawn: bool,
 }
 
 /// The picture of the whole desktop, kept up to date monitor by monitor.
@@ -157,6 +160,7 @@ impl Duplicator {
                         ),
                         size: (w as usize, h as usize),
                         seen: false,
+                        drawn: false,
                     });
                 }
             }
@@ -183,11 +187,51 @@ impl Duplicator {
         if desktop() != (self.origin, self.size) {
             return Err(());
         }
+        self.dirty.clear();
+        let mut changed = false;
+        for i in 0..self.outputs.len() {
+            let wait = if self.outputs[i].seen {
+                0
+            } else {
+                FIRST_PICTURE_MS
+            };
+            changed |= self.take(i, wait)?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether every monitor has handed over a picture that was really drawn.
+    pub fn drawn(&self) -> bool {
+        self.outputs.iter().all(|o| o.drawn)
+    }
+
+    /// Waits up to `ms` for every monitor to hand over a picture that was
+    /// really drawn, for a capture made right after duplication was set up.
+    /// `Ok(false)` when one did not come: the screen is not being drawn.
+    pub fn wait_until_drawn(&mut self, ms: u64) -> Result<bool, ()> {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while !self.drawn() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            for i in 0..self.outputs.len() {
+                if !self.outputs[i].drawn {
+                    self.take(i, (left.as_millis() as u32).clamp(1, 50))?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Takes monitor `i`'s next picture, waiting up to `wait` ms for it, and
+    /// copies what changed into the whole picture. `Ok(true)` when something
+    /// changed.
+    fn take(&mut self, i: usize, wait: u32) -> Result<bool, ()> {
         let stride = self.size.0 as usize * 4;
         let mut changed = false;
-        self.dirty.clear();
-        for output in &mut self.outputs {
-            let wait = if output.seen { 0 } else { FIRST_PICTURE_MS };
+        let output = &mut self.outputs[i];
+        {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             unsafe {
@@ -196,8 +240,13 @@ impl Duplicator {
                     .AcquireNextFrame(wait, &mut info, &mut resource)
                 {
                     Ok(()) => {}
-                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT && output.seen => continue,
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT && output.seen => {
+                        return Ok(false);
+                    }
                     Err(_) => return Err(()),
+                }
+                if info.LastPresentTime != 0 {
+                    output.drawn = true;
                 }
                 // A present time of zero: only the mouse pointer moved, and
                 // the pointer is not part of the picture.

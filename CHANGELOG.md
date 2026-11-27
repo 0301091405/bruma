@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.2 - 2026-11-27
+
+- `PrintScreen` answers at once on a busy machine. With every core taken by a
+  game it could take seconds, or not answer at all.
+- It works in full-screen games, including ones run as administrator (anti-
+  cheat often starts them so): the selection opens over the game, and you're
+  returned to the game afterwards. Setup asks Windows once to let Bruma run as
+  administrator for this; say no and it runs as before.
+- Where nothing can be shown over a game, the screen is copied at once and a
+  shutter sound plays.
+- While a game or a film fills the screen, Bruma gives back the memory it
+  keeps for rewind and GIFs.
+- `bruma quit` stops the running Bruma.
+
 ## 0.7.1 - 2026-11-26
 
 - A Bruma that was ended without closing no longer leaves its icon behind in

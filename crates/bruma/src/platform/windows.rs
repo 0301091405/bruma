@@ -271,6 +271,65 @@ pub fn capture() -> Result<Capture, String> {
     })
 }
 
+/// Gives a window of Bruma's the keyboard. Right after the hotkey Windows
+/// allows it; `false` when it did not.
+pub fn bring_forward(window: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let hwnd = HWND(window as *mut c_void);
+    unsafe { GetForegroundWindow() == hwnd || SetForegroundWindow(hwnd).as_bool() }
+}
+
+/// Gives a window of Bruma's the keyboard even when Windows would rather
+/// leave it where it is: a game in front, played with, keeps it otherwise.
+/// Windows lets the program that sent the last key take the keyboard, so a
+/// key-up of a key no keyboard has is sent first, which nothing acts on.
+/// Over a game run as administrator this works only when Bruma runs as
+/// administrator too. `true` when the window has the keyboard.
+pub fn force_forward(window: isize) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    if bring_forward(window) {
+        return true;
+    }
+    let hwnd = HWND(window as *mut c_void);
+    let nothing = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                // 0x88 to 0x8F are not given to any key.
+                wVk: VIRTUAL_KEY(0x88),
+                dwFlags: KEYEVENTF_KEYUP,
+                ..Default::default()
+            },
+        },
+    };
+    unsafe {
+        SendInput(&[nothing], size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd);
+        GetForegroundWindow() == hwnd
+    }
+}
+
+/// Hands the keyboard back to a window that had it, bringing it back up if
+/// it went down to the taskbar (a full-screen game does when it loses it).
+pub fn give_back(window: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+    let hwnd = HWND(window as *mut c_void);
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return;
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 /// Puts a hidden window on screen and leaves the active window alone.
 pub fn show_without_activating(window: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
@@ -284,14 +343,53 @@ pub fn captures_cursor() -> bool {
     CAPTURE_CURSOR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Puts a thread that was told to stay in the background ahead of ordinary
-/// work, for something the user is waiting for. The thread goes back by
-/// calling [`run_this_thread_in_the_background`].
+/// Puts a thread that was told to stay in the background ahead of
+/// everything else, for something the user is waiting for. The thread goes
+/// back by calling [`run_this_thread_in_the_background`].
 pub fn hurry(thread: &std::thread::JoinHandle<()>) {
     use std::os::windows::io::AsRawHandle;
-    use windows::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    use windows::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
     unsafe {
-        let _ = SetThreadPriority(HANDLE(thread.as_raw_handle()), THREAD_PRIORITY_ABOVE_NORMAL);
+        let _ = SetThreadPriority(
+            HANDLE(thread.as_raw_handle()),
+            THREAD_PRIORITY_TIME_CRITICAL,
+        );
+    }
+}
+
+/// Puts the calling thread ahead of all ordinary work, a game's included.
+/// For the thread that answers the hotkey: it sleeps until then, so this
+/// costs nothing, and when the key comes it is not left waiting behind
+/// whatever keeps the processor busy.
+pub fn run_this_thread_first() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+}
+
+/// Puts a thread ahead of all ordinary work, like [`run_this_thread_first`]:
+/// for helpers the hotkey's thread waits on.
+pub fn put_first(thread: &impl std::os::windows::io::AsRawHandle) {
+    use windows::Win32::System::Threading::THREAD_PRIORITY_TIME_CRITICAL;
+    set_thread_priority(thread, THREAD_PRIORITY_TIME_CRITICAL.0);
+}
+
+/// The calling thread's priority, to hand on to a helper thread.
+pub fn this_thread_priority() -> i32 {
+    use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    unsafe { GetThreadPriority(GetCurrentThread()) }
+}
+
+/// Gives a thread just started a priority read with [`this_thread_priority`].
+/// The thread that started it does this, since on a busy machine the new
+/// thread may not get to run to do it itself.
+pub fn set_thread_priority(thread: &impl std::os::windows::io::AsRawHandle, level: i32) {
+    use windows::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY};
+    unsafe {
+        let _ = SetThreadPriority(HANDLE(thread.as_raw_handle()), THREAD_PRIORITY(level));
     }
 }
 
@@ -500,7 +598,7 @@ pub fn local_time() -> LocalTime {
 }
 
 /// Held for the life of the background process; a second holder is refused.
-pub struct SingleInstance(#[allow(dead_code)] HANDLE);
+pub struct SingleInstance(HANDLE);
 
 impl SingleInstance {
     /// `None` when another bruma background process already runs.
@@ -515,6 +613,108 @@ impl SingleInstance {
     }
 }
 
+impl Drop for SingleInstance {
+    /// Lets go, so that another Bruma (one run as administrator, taking
+    /// over) can be the one in the background.
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+// ---- requests between processes ----------------------------------------------
+
+/// A named event other programs of this user can signal, also when Bruma
+/// runs as administrator and they do not: by default such an event would be
+/// out of their reach. Auto-reset, unsignalled.
+fn open_event(name: windows::core::PCWSTR) -> Option<HANDLE> {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    unsafe {
+        // Signed-in users may use it, and its integrity level is medium, so
+        // that a program not run as administrator may signal it.
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let described = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;GA;;;AU)S:(ML;;NW;;;ME)"),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .is_ok();
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let event = CreateEventW(
+            described.then_some(&attributes as *const _),
+            false,
+            false,
+            name,
+        );
+        if described {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(descriptor.0),
+            ));
+        }
+        event.ok()
+    }
+}
+
+/// Runs `on_request` every time the event `name` is signalled.
+fn listen(
+    name: windows::core::PCWSTR,
+    thread: &str,
+    on_request: impl Fn() + Send + 'static,
+) -> bool {
+    let Some(event) = open_event(name) else {
+        return false;
+    };
+    // A raw handle is just a number; move it into the thread as one.
+    let raw = event.0 as isize;
+    std::thread::Builder::new()
+        .name(thread.into())
+        .spawn(move || {
+            let event = HANDLE(raw as *mut c_void);
+            while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 {
+                on_request();
+            }
+        })
+        .is_ok()
+}
+
+/// Signals the event `name`; `false` when nobody is listening.
+fn signal(name: windows::core::PCWSTR) -> bool {
+    unsafe {
+        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, name) else {
+            return false;
+        };
+        // Hand our right to take the foreground to whoever answers.
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let sent = SetEvent(event).is_ok();
+        let _ = CloseHandle(event);
+        sent
+    }
+}
+
+const QUIT_REQUEST: windows::core::PCWSTR = w!("Local\\bruma-quit-request");
+
+/// Asks the background process to quit (setup does, before replacing it).
+/// `false` when none is running.
+pub fn request_quit() -> bool {
+    signal(QUIT_REQUEST)
+}
+
+/// Background side of [`request_quit`].
+pub fn listen_for_quit_requests(on_request: impl Fn() + Send + 'static) -> bool {
+    listen(QUIT_REQUEST, "bruma-quit-requests", on_request)
+}
+
 // ---- capture requests between processes -------------------------------------
 
 const CAPTURE_REQUEST: windows::core::PCWSTR = w!("Local\\bruma-capture-request");
@@ -523,35 +723,13 @@ const CAPTURE_REQUEST: windows::core::PCWSTR = w!("Local\\bruma-capture-request"
 /// started from the command line can still rewind. `false` when no background
 /// process is listening.
 pub fn request_capture() -> bool {
-    unsafe {
-        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, CAPTURE_REQUEST) else {
-            return false;
-        };
-        // Hand our right to take the foreground to whoever shows the overlay.
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        let sent = SetEvent(event).is_ok();
-        let _ = CloseHandle(event);
-        sent
-    }
+    signal(CAPTURE_REQUEST)
 }
 
 /// Background side: runs `on_request` every time another process asks for a
 /// capture. Returns `false` when the listener could not be set up.
 pub fn listen_for_capture_requests(on_request: impl Fn() + Send + 'static) -> bool {
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, CAPTURE_REQUEST) }) else {
-        return false;
-    };
-    // A raw handle is just a number; move it into the thread as one.
-    let raw = event.0 as isize;
-    std::thread::Builder::new()
-        .name("bruma-requests".into())
-        .spawn(move || {
-            let event = HANDLE(raw as *mut c_void);
-            while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 {
-                on_request();
-            }
-        })
-        .is_ok()
+    listen(CAPTURE_REQUEST, "bruma-requests", on_request)
 }
 
 // ---- clipboard --------------------------------------------------------------
@@ -943,6 +1121,268 @@ pub fn foreground_window() -> isize {
     unsafe { GetForegroundWindow().0 as isize }
 }
 
+/// The key the keyboard hook watches for: its virtual-key code in the low
+/// 16 bits and [`MOD_CTRL`]-style modifier bits above; 0 for none.
+static WATCHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether the watched key is down, so holding it takes one capture.
+static WATCHED_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What a press of the watched key does.
+static ON_WATCHED: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+pub const MOD_CTRL: u32 = 1;
+pub const MOD_SHIFT: u32 = 2;
+pub const MOD_ALT: u32 = 4;
+pub const MOD_WIN: u32 = 8;
+
+/// The modifier keys held right now, as `MOD_*` bits.
+fn modifiers_held() -> u32 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+    let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+        GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0
+    };
+    let mut mods = 0;
+    if held(VK_CONTROL) {
+        mods |= MOD_CTRL;
+    }
+    if held(VK_SHIFT) {
+        mods |= MOD_SHIFT;
+    }
+    if held(VK_MENU) {
+        mods |= MOD_ALT;
+    }
+    if held(VK_LWIN) || held(VK_RWIN) {
+        mods |= MOD_WIN;
+    }
+    mods
+}
+
+unsafe extern "system" fn keyboard_hook(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
+    };
+    let watched = WATCHED.load(Relaxed);
+    if code == HC_ACTION as i32 && watched != 0 {
+        let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if info.vkCode == watched & 0xFFFF {
+            let message = wparam.0 as u32;
+            if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+                if modifiers_held() == watched >> 16 {
+                    if !WATCHED_DOWN.swap(true, Relaxed) {
+                        if let Some(on) = ON_WATCHED.get() {
+                            on();
+                        }
+                    }
+                    // Bruma's key: the program in front does not get it.
+                    return windows::Win32::Foundation::LRESULT(1);
+                }
+            } else if (message == WM_KEYUP || message == WM_SYSKEYUP)
+                && WATCHED_DOWN.swap(false, Relaxed)
+            {
+                return windows::Win32::Foundation::LRESULT(1);
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Whether process `pid` runs as administrator.
+fn is_elevated(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut token = HANDLE::default();
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0u32;
+        let ok = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok()
+            && GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut size,
+            )
+            .is_ok();
+        if !token.is_invalid() {
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(process);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Whether the program behind the window in front runs as administrator;
+/// Windows then keeps its keys from Bruma's hook and hotkey. `cache` holds
+/// the last answer, by process.
+fn front_is_elevated(cache: &mut (u32, bool)) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };
+    if pid == 0 {
+        return false;
+    }
+    if cache.0 != pid {
+        *cache = (pid, is_elevated(pid));
+    }
+    cache.1
+}
+
+/// While a program run as administrator is in front, Windows gives its
+/// keys to no hook or hotkey of Bruma's; the key's state can still be asked
+/// for. So then, and only then, the watched key is looked at every 15 ms.
+fn poll_watched_key(down: &mut bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let watched = WATCHED.load(Relaxed);
+    if watched == 0 {
+        *down = false;
+        return;
+    }
+    let pressed = unsafe { GetAsyncKeyState((watched & 0xFFFF) as i32) } as u16 & 0x8000 != 0;
+    if pressed && !*down && modifiers_held() == watched >> 16 {
+        if let Some(on) = ON_WATCHED.get() {
+            on();
+        }
+    }
+    *down = pressed;
+}
+
+/// Watches the keyboard for the hotkey as well, from a thread of its own.
+///
+/// Registering a hotkey is not enough in front of many games: a program
+/// reading the keyboard directly can tell Windows to hold back other
+/// programs' hotkeys while it is in front, and PrintScreen then never
+/// arrives. A keyboard hook sees the key all the same. The hook only looks
+/// at the one key and passes everything else straight on; its thread does
+/// nothing else and goes ahead of other work, so typing never waits for it.
+/// `false` when the hook could not be set.
+pub fn watch_for_hotkey(on_press: impl Fn() + Send + Sync + 'static) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+    };
+    if ON_WATCHED.set(Box::new(on_press)).is_err() {
+        return true;
+    }
+    let (told, started) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("bruma-keys".into())
+        .spawn(move || {
+            run_this_thread_first();
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            let module = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
+            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
+            if let Err(e) = &hook {
+                eprintln!("bruma: no keyboard hook: {e}");
+            }
+            let _ = told.send(hook.is_ok());
+            if hook.is_err() {
+                return;
+            }
+            // Twice a second: is a program run as administrator in front?
+            // While one is, the key is looked at every 15 ms.
+            use windows::Win32::System::Threading::GetCurrentProcessId;
+            use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_TIMER};
+            // Run as administrator itself, Bruma sees every key anyway.
+            let watch_front = !is_elevated(unsafe { GetCurrentProcessId() });
+            let slow = if watch_front {
+                unsafe { SetTimer(None, 0, 500, None) }
+            } else {
+                0
+            };
+            let mut fast = 0usize;
+            let mut front = (0u32, false);
+            let mut down = false;
+            let mut message = MSG::default();
+            unsafe {
+                while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                    if message.message == WM_TIMER && message.hwnd.is_invalid() {
+                        if message.wParam.0 == slow {
+                            let elevated = front_is_elevated(&mut front);
+                            if elevated && fast == 0 {
+                                fast = SetTimer(None, 0, 15, None);
+                            } else if !elevated && fast != 0 {
+                                let _ = KillTimer(None, fast);
+                                fast = 0;
+                                down = false;
+                            }
+                        } else if message.wParam.0 == fast {
+                            poll_watched_key(&mut down);
+                        }
+                        continue;
+                    }
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        });
+    spawned.is_ok() && started.recv().unwrap_or(false)
+}
+
+/// Sets the key the hook watches for: a virtual-key code and `MOD_*` bits;
+/// `None` to watch for nothing (while the settings listen for a new key).
+pub fn set_watched_hotkey(key: Option<(u16, u32)>) {
+    let value = key.map_or(0, |(vk, mods)| vk as u32 | mods << 16);
+    WATCHED.store(value, std::sync::atomic::Ordering::Relaxed);
+    WATCHED_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Plays the shutter sound without waiting for it.
+pub fn play_shutter() {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    // Kept for good: the sound plays from it after this returns.
+    static SOUND: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let wav = SOUND.get_or_init(bruma_core::sound::shutter);
+    unsafe {
+        let _ = PlaySoundW(
+            windows::core::PCWSTR(wav.as_ptr() as *const u16),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        );
+    }
+}
+
+/// The middle of a window, in desktop coordinates.
+pub fn window_centre(window: isize) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(HWND(window as *mut c_void), &mut rect) }.ok()?;
+    Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+}
+
+/// For the trace: what kind of window the one in front is, and where.
+pub fn describe_window(window: isize) -> String {
+    let hwnd = HWND(window as *mut c_void);
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    let mut rect = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    format!(
+        "class {}, pid {pid}, at {},{} size {}x{}, ex style {ex:08X}",
+        String::from_utf16_lossy(&class[..n]),
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top
+    )
+}
+
 /// Asks for a folder with the system's own dialog, starting in `start`.
 /// `None` when the person cancels.
 pub fn pick_folder(owner: Option<isize>, start: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -985,32 +1425,151 @@ const SETTINGS_REQUEST: windows::core::PCWSTR = w!("Local\\bruma-settings-reques
 /// Asks the background process to show its settings. `false` when there is
 /// none.
 pub fn request_settings() -> bool {
-    unsafe {
-        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, SETTINGS_REQUEST) else {
-            return false;
-        };
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        let sent = SetEvent(event).is_ok();
-        let _ = CloseHandle(event);
-        sent
-    }
+    signal(SETTINGS_REQUEST)
 }
 
 /// Background side of [`request_settings`].
 pub fn listen_for_settings_requests(on_request: impl Fn() + Send + 'static) -> bool {
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, SETTINGS_REQUEST) }) else {
+    listen(SETTINGS_REQUEST, "bruma-settings-requests", on_request)
+}
+
+// ---- running as administrator, for games that do --------------------------------
+
+/// The task Windows' Task Scheduler starts Bruma with when it is to run as
+/// administrator. Made once, with the person's consent, it starts Bruma
+/// that way without asking each time.
+const GAMES_TASK: &str = "Bruma";
+
+/// Whether this Bruma runs as administrator.
+pub fn running_as_administrator() -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    is_elevated(unsafe { GetCurrentProcessId() })
+}
+
+/// Runs `schtasks` with `args`, quietly; whether it succeeded.
+fn schtasks(args: &[&str]) -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("schtasks")
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether the task that starts Bruma as administrator is there and starts
+/// `exe`: a task left by a copy elsewhere would start that one, or nothing.
+pub fn games_task_starts(exe: &std::path::Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    let Ok(out) = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", GAMES_TASK, "/XML"])
+        .creation_flags(0x0800_0000)
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
         return false;
     };
-    let raw = event.0 as isize;
-    std::thread::Builder::new()
-        .name("bruma-settings-requests".into())
-        .spawn(move || {
-            let event = HANDLE(raw as *mut c_void);
-            while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 {
-                on_request();
-            }
-        })
-        .is_ok()
+    if !out.status.success() {
+        return false;
+    }
+    let xml = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    let wanted = exe
+        .display()
+        .to_string()
+        .to_lowercase()
+        .replace('&', "&amp;");
+    xml.contains(&format!("<command>{wanted}</command>"))
+}
+
+/// Starts Bruma as administrator through its task; no question is asked.
+pub fn start_games_task() -> bool {
+    schtasks(&["/Run", "/TN", GAMES_TASK])
+}
+
+/// Makes the task that starts `exe` as administrator. Needs to run as
+/// administrator itself.
+pub fn create_games_task(exe: &std::path::Path) -> Result<(), String> {
+    // Escaped for XML.
+    let command = exe
+        .display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    // Started on request only; at the usual priority (the scheduler's own
+    // default is below it); never stopped after a while or on battery.
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Bruma with administrator rights, so that its hotkey also works over games that run that way.</Description></RegistrationInfo>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>takeover</Arguments></Exec></Actions>
+</Task>
+"#
+    );
+    let file = std::env::temp_dir().join(format!("bruma-task-{}.xml", std::process::id()));
+    // The scheduler reads the file as UTF-16, as its first line says.
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+    let file_arg = file.display().to_string();
+    let made = schtasks(&["/Create", "/TN", GAMES_TASK, "/XML", &file_arg, "/F"]);
+    let _ = std::fs::remove_file(&file);
+    if made {
+        Ok(())
+    } else {
+        Err("the task could not be made".into())
+    }
+}
+
+/// Removes the task. Needs to run as administrator.
+pub fn delete_games_task() -> bool {
+    schtasks(&["/Delete", "/TN", GAMES_TASK, "/F"])
+}
+
+/// Runs this program again as administrator with `args`, after Windows has
+/// asked the person, and waits for it. `Ok(true)` when it ran and
+/// succeeded, `Ok(false)` when it failed, `Err` when the person said no or
+/// it could not be started.
+pub fn run_as_administrator(args: &str) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Threading::GetExitCodeProcess;
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let file: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let params: Vec<u16> = args.encode_utf16().chain([0]).collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: w!("runas"),
+        lpFile: windows::core::PCWSTR(file.as_ptr()),
+        lpParameters: windows::core::PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|_| "Windows did not allow it".to_string())?;
+        if info.hProcess.is_invalid() {
+            return Err("it did not start".into());
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        Ok(code == 0)
+    }
 }
 
 // ---- the icon in the notification area ---------------------------------------
@@ -1092,6 +1651,138 @@ fn icon_from_rgba(
         let _ = DeleteObject(mask.into());
         icon.map_err(|e| e.to_string())
     }
+}
+
+thread_local! {
+    /// What a hotkey press does, for [`answer_hotkeys_directly`].
+    static ON_HOTKEY: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The window procedure the hotkey library gave its window, called for
+/// everything but the hotkey itself.
+static HOTKEY_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+unsafe extern "system" fn hotkey_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{CallWindowProcW, WM_HOTKEY, WNDPROC};
+    if msg == WM_HOTKEY {
+        let answered = ON_HOTKEY.with(|on| on.borrow().as_ref().map(|on| on()).is_some());
+        if answered {
+            return windows::Win32::Foundation::LRESULT(0);
+        }
+    }
+    let previous = HOTKEY_PROC.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let previous: WNDPROC = std::mem::transmute(previous);
+        CallWindowProcW(previous, hwnd, msg, wparam, lparam)
+    }
+}
+
+/// Answers the hotkeys registered by the hotkey library on this thread
+/// directly, with `on_hotkey`, instead of through the library. The library
+/// starts a thread on every press to watch for the key's release, which
+/// Bruma does not use; on a machine kept busy by a game, showing the
+/// capture was seen to wait up to two seconds behind that thread.
+pub fn answer_hotkeys_directly(on_hotkey: impl Fn() + 'static) -> bool {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GWLP_WNDPROC, SetWindowLongPtrW,
+    };
+    unsafe extern "system" fn find(hwnd: HWND, found: LPARAM) -> BOOL {
+        let mut class = [0u16; 32];
+        let n = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+        if String::from_utf16_lossy(&class[..n]) == "global_hotkey_app" {
+            unsafe { *(found.0 as *mut HWND) = hwnd };
+            return false.into();
+        }
+        true.into()
+    }
+    let mut window = HWND::default();
+    unsafe {
+        let _ = EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(find),
+            LPARAM(&mut window as *mut HWND as isize),
+        );
+    }
+    if window.is_invalid() || HOTKEY_PROC.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        return false;
+    }
+    ON_HOTKEY.with(|on| *on.borrow_mut() = Some(Box::new(on_hotkey)));
+    let previous = unsafe {
+        SetWindowLongPtrW(
+            window,
+            GWLP_WNDPROC,
+            hotkey_proc as *const () as usize as isize,
+        )
+    };
+    if previous == 0 {
+        ON_HOTKEY.with(|on| *on.borrow_mut() = None);
+        return false;
+    }
+    HOTKEY_PROC.store(previous, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+thread_local! {
+    static OWNER: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// A window that is never shown, to own Bruma's other windows. An owned
+/// window has no taskbar button; one with a button makes Windows wait for
+/// the taskbar when it is shown and given the keyboard, and on a machine
+/// kept busy by a game that wait was seen to reach two seconds. Made on
+/// first use, on the thread that runs the window loop.
+pub fn owner_window() -> isize {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP,
+    };
+    if let Some(owner) = OWNER.with(|o| Some(o.get()).filter(|&h| h != 0)) {
+        return owner;
+    }
+    unsafe extern "system" fn plain(
+        hwnd: HWND,
+        msg: u32,
+        wparam: windows::Win32::Foundation::WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+    let owner = unsafe {
+        let Ok(instance) = GetModuleHandleW(None) else {
+            return 0;
+        };
+        let class = w!("bruma_owner");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(plain),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        });
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            w!("bruma owner"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .map(|h| h.0 as isize)
+        .unwrap_or(0)
+    };
+    OWNER.with(|o| o.set(owner));
+    owner
 }
 
 /// The icon's lasting name. With it, an icon left behind by a Bruma that was
