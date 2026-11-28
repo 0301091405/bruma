@@ -43,6 +43,18 @@ pub enum UserEvent {
     GifDone(Result<std::path::PathBuf, String>, bool, u64),
     /// Another process (setup, say) asked Bruma to quit.
     Quit,
+    /// The link found in the area chosen in capture `capture`, for the card.
+    CardLink {
+        capture: u64,
+        link: bruma_core::links::Link,
+    },
+    /// The links found on the frozen screen of capture `capture`, in its
+    /// frame `frame`.
+    Links {
+        capture: u64,
+        frame: usize,
+        links: Vec<bruma_core::links::Link>,
+    },
     /// The report for a bug, ready to be copied.
     Report(String),
     /// The task that starts Bruma as administrator was made (`Ok(true)`), or
@@ -138,6 +150,16 @@ struct App {
     again: Option<Snapshot>,
     /// GIFs being written in the background.
     gifs: usize,
+    /// Counts the overlays opened, so that a late answer about an earlier
+    /// one is told apart.
+    capture: u64,
+    /// The last finished search for links, and the overlay it was for.
+    scan: Option<(u64, usize, Vec<bruma_core::links::Link>)>,
+    /// The link the next preview card offers.
+    card_link: Option<bruma_core::links::Link>,
+    /// What the preview card showed, to show it again with a link found
+    /// after it came up.
+    card_redo: Option<(Scene, String, Image)>,
     /// The full-screen game the overlay opened over, to give it the
     /// keyboard back when the overlay closes.
     back_to: Option<isize>,
@@ -180,7 +202,10 @@ impl App {
             !had_message,
         );
         match opened {
-            Ok(overlay) => self.overlay = Some(overlay),
+            Ok(overlay) => {
+                self.overlay = Some(overlay);
+                self.scan_for_links();
+            }
             Err(e) => {
                 if let Some(rewind) = &self.rewind {
                     rewind.resume();
@@ -246,6 +271,9 @@ impl App {
         let scene = overlay.context();
         let mut snapshot = overlay.snapshot();
         let mut message: Option<Message> = None;
+        // Whether the card may offer a link: not for a scrolled capture,
+        // whose picture is not the frozen screen's.
+        let mut offer_link = false;
         // Sent just ahead of a save: what makes the file editable, and its steps.
         let mut source: Option<(Image, Vec<Annotation>)> = None;
         let mut steps: Option<u32> = None;
@@ -258,6 +286,7 @@ impl App {
                     }
                 }
                 Effect::Copy(image) => {
+                    offer_link = true;
                     let caption = match platform::copy_image(&image) {
                         Ok(()) => format!("Copied {} \u{00D7} {}", image.width, image.height),
                         Err(e) => e,
@@ -270,7 +299,9 @@ impl App {
                     message = Some(Message::Shot(caption, image));
                 }
                 Effect::CopyText(text) => {
-                    message = Some(Message::Text(match platform::copy_text(&text) {
+                    let copied = platform::copy_text(&text);
+                    crate::note(|| format!("copy text: {copied:?}"));
+                    message = Some(Message::Text(match copied {
                         Ok(()) => format!("{text} copied"),
                         Err(e) => e,
                     }));
@@ -372,6 +403,7 @@ impl App {
                     });
                 }
                 Effect::Save(image) => {
+                    offer_link = true;
                     let caption = self.save(&image, source.take(), steps.take());
                     self.remember(&image);
                     message = Some(Message::Shot(caption, image));
@@ -422,10 +454,50 @@ impl App {
             }
         }
         if self.overlay.is_none() {
+            self.card_link = None;
+            let offer = card_offers_link(offer_link, self.editing.is_some());
+            if let (true, Some(Message::Shot(caption, image))) = (offer, &message) {
+                self.prepare_card_link(&scene, caption, image);
+            }
             if let Some(message) = message {
                 self.show_message(event_loop, &scene, message);
             }
         }
+    }
+
+    /// Finds the link the card for `scene`'s chosen area offers: from the
+    /// search of the whole screen if it is done, otherwise by looking at
+    /// the area alone, away from this thread; the card is then shown again
+    /// with it when it comes.
+    fn prepare_card_link(&mut self, scene: &Scene, caption: &str, image: &Image) {
+        self.card_link = None;
+        self.card_redo = None;
+        let Some(area) = scene.selection.filter(|_| self.config.links) else {
+            return;
+        };
+        if let Some(links) = links_for(&self.scan, self.capture, scene.frame) {
+            self.card_link = bruma_core::links::for_card(links, area).cloned();
+            return;
+        }
+        self.card_redo = Some((scene.clone(), caption.to_string(), image.clone()));
+        let crop = scene.screen.crop(area);
+        let capture = self.capture;
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new()
+            .name("bruma-card-links".into())
+            .spawn(move || {
+                platform::run_this_thread_in_the_background();
+                bruma_core::par::keep_jobs_on_this_thread();
+                let words = platform::ocr(&crop).unwrap_or_default();
+                let mut links = bruma_core::links::in_words(&words);
+                links.extend(bruma_core::links::in_qr_codes(&crop));
+                for link in &mut links {
+                    link.rect = link.rect.translate(area.x, area.y);
+                }
+                if let Some(link) = bruma_core::links::for_card(&links, area).cloned() {
+                    let _ = proxy.send_event(UserEvent::CardLink { capture, link });
+                }
+            });
     }
 
     /// The first time Bruma runs: the intro, and after it a message saying
@@ -470,6 +542,7 @@ impl App {
         let capture = platform::capture().ok()?;
         let (at, size) = (monitor.position(), monitor.size());
         Some(Scene {
+            frame: 0,
             origin: capture.origin,
             monitor: bruma_core::Rect::new(
                 (at.x - capture.origin.0) as f32,
@@ -481,6 +554,44 @@ impl App {
             selection: None,
             screen: std::sync::Arc::new(capture.image),
         })
+    }
+
+    /// Starts looking for links and QR codes on the overlay's frozen screen,
+    /// away from the overlay's thread and behind other work: the overlay
+    /// never waits for it. Off in the settings, nothing is looked at.
+    fn scan_for_links(&mut self) {
+        self.capture += 1;
+        self.scan = None;
+        let Some(overlay) = self.overlay.as_ref().filter(|_| self.config.links) else {
+            return;
+        };
+        let (image, frame, monitors) = overlay.scan_input();
+        let capture = self.capture;
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new()
+            .name("bruma-links".into())
+            .spawn(move || {
+                platform::run_this_thread_in_the_background();
+                bruma_core::par::keep_jobs_on_this_thread();
+                let started = Instant::now();
+                // A monitor at a time: a whole desktop of several may be
+                // wider than text recognition accepts.
+                let links = bruma_core::links::in_parts(&image, &monitors, |part| {
+                    platform::ocr(part).unwrap_or_default()
+                });
+                crate::note(|| {
+                    format!(
+                        "links: {} found in {:.0} ms",
+                        links.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    )
+                });
+                let _ = proxy.send_event(UserEvent::Links {
+                    capture,
+                    frame,
+                    links,
+                });
+            });
     }
 
     /// Closes the overlay, keeping what it learnt for the next capture.
@@ -507,6 +618,10 @@ impl App {
     /// could not be read.
     fn capture_over_a_game(&mut self, event_loop: &ActiveEventLoop) -> bool {
         let started = Instant::now();
+        // A capture of its own: a search for links made for an earlier one
+        // says nothing about it.
+        self.capture += 1;
+        self.scan = None;
         let (screen, origin) = match self.rewind.as_ref().and_then(Rewind::shot) {
             Some(shot) => (shot.image, shot.origin),
             None => match platform::capture() {
@@ -574,12 +689,14 @@ impl App {
             scale,
         });
         let scene = Scene {
+            frame: 0,
             screen,
             origin,
             monitor: area,
             scale,
             selection: Some(area),
         };
+        self.prepare_card_link(&scene, &caption, &image);
         self.show_message(event_loop, &scene, Message::Shot(caption, image));
         true
     }
@@ -622,6 +739,7 @@ impl App {
             history: self.config.history,
             autostart: platform::autostart_enabled(),
             // On only when it is so: as administrator, or with the task there.
+            links: self.config.links,
             games: self.config.games
                 && (platform::running_as_administrator()
                     || std::env::current_exe().is_ok_and(|exe| platform::games_task_starts(&exe))),
@@ -757,6 +875,7 @@ impl App {
         self.config.quick = values.quick;
         self.config.clip = values.clip;
         self.config.snap = values.snap;
+        self.config.links = values.links;
         if let Some(prefs) = &mut self.prefs {
             prefs.snap = values.snap;
         }
@@ -948,6 +1067,7 @@ impl App {
         let desktop = |x: f32, y: f32| (scene.origin.0 + x as i32, scene.origin.1 + y as i32);
         let preview = Duration::from_secs_f32(self.config.preview.clamp(0.0, 60.0));
         let hello = matches!(message, Message::Hello(_));
+        let mut link = None;
         let (picture, rect, lifetime, pin) = match message {
             // A capture gets a card with a thumbnail; clicking it pins the
             // capture back where it was taken.
@@ -957,14 +1077,18 @@ impl App {
                 } else {
                     caption
                 };
-                let (picture, rect) = bruma_core::render::preview_card(
+                let offered = self.card_link.take();
+                let line = offered.as_ref().map(bruma_core::links::card_line);
+                let (picture, rect, line_rect) = bruma_core::render::preview_card_with_link(
                     &scene.screen,
                     &image,
                     &self.fonts,
                     &caption,
                     scene.monitor,
                     scene.scale,
+                    line.as_deref(),
                 );
+                link = line_rect.zip(offered).map(|(r, l)| (r, l.url, l.kind));
                 let at = match scene.selection {
                     Some(sel) => desktop(sel.x, sel.y),
                     None => desktop(scene.monitor.x, scene.monitor.y),
@@ -994,6 +1118,7 @@ impl App {
             lifetime,
             pin,
             edit,
+            link,
         ) {
             Ok(toast) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(toast.deadline()));
@@ -1022,7 +1147,10 @@ impl App {
             snapshot,
         );
         match opened {
-            Ok(overlay) => self.overlay = Some(overlay),
+            Ok(overlay) => {
+                self.overlay = Some(overlay);
+                self.scan_for_links();
+            }
             Err(e) => {
                 eprintln!("bruma: {e}");
                 self.resume_recording();
@@ -1163,6 +1291,31 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::TrayMenu(icon) => self.open_menu(event_loop, icon),
             UserEvent::Settings => self.open_settings(event_loop),
             UserEvent::Quit => event_loop.exit(),
+            UserEvent::CardLink { capture, link } => {
+                // Still the card it was looked for, and still on screen.
+                if capture == self.capture && self.toast.is_some() {
+                    if let Some((scene, caption, image)) = self.card_redo.take() {
+                        self.card_link = Some(link);
+                        self.show_message(event_loop, &scene, Message::Shot(caption, image));
+                    }
+                }
+            }
+            UserEvent::Links {
+                capture,
+                frame,
+                links,
+            } => {
+                // An answer about an overlay that has closed since is no use.
+                if capture != self.capture {
+                    return;
+                }
+                self.scan = Some((capture, frame, links.clone()));
+                let effects = match self.overlay.as_mut() {
+                    Some(overlay) => overlay.feed(Input::Links { frame, links }),
+                    None => Vec::new(),
+                };
+                self.apply(event_loop, effects);
+            }
             UserEvent::Report(text) => {
                 let said = match platform::copy_text(&text) {
                     Ok(()) => "A report is copied: paste it into your bug report. \
@@ -1239,6 +1392,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.toast = None;
                     self.edit_again(event_loop);
                 }
+                ToastAction::CopyLink(url, kind) => {
+                    self.toast = None;
+                    let said = match platform::copy_text(&url) {
+                        Ok(()) => match kind {
+                            bruma_core::links::Kind::Web => "Link copied".to_string(),
+                            bruma_core::links::Kind::Text => "Text copied".to_string(),
+                        },
+                        Err(e) => e,
+                    };
+                    if let Some(scene) = self.scene_now(event_loop) {
+                        self.show_message(event_loop, &scene, Message::Text(said));
+                    }
+                }
             }
         }
         self.exit_when_idle(event_loop);
@@ -1309,6 +1475,10 @@ pub fn run(background: bool, config: Config, editing: Option<EditJob>) -> Result
         menu: None,
         again: None,
         gifs: 0,
+        capture: 0,
+        scan: None,
+        card_link: None,
+        card_redo: None,
         back_to: None,
         games_hint: false,
         rewind: None,
@@ -1338,5 +1508,54 @@ mod tests {
         assert!(text.contains("![screenshot](shot.png)"));
         assert_eq!(text.lines().filter(|l| l.ends_with(". ")).count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The links a finished search found, if it was made for this capture and
+/// the frame the card's picture comes from (the person may have rewound).
+fn links_for(
+    scan: &Option<(u64, usize, Vec<bruma_core::links::Link>)>,
+    capture: u64,
+    frame: usize,
+) -> Option<&[bruma_core::links::Link]> {
+    scan.as_ref()
+        .filter(|(c, f, _)| *c == capture && *f == frame)
+        .map(|(_, _, links)| links.as_slice())
+}
+
+/// Whether a preview card may offer a link: after copying or saving an area
+/// chosen on the frozen screen, not in the file editor.
+fn card_offers_link(chosen_area: bool, editing: bool) -> bool {
+    chosen_area && !editing
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use bruma_core::links::{Kind, Link};
+
+    #[test]
+    fn a_search_serves_only_its_capture_and_frame() {
+        let link = Link {
+            url: "https://example.com".into(),
+            rect: bruma_core::Rect::new(0.0, 0.0, 10.0, 10.0),
+            kind: Kind::Web,
+            qr: false,
+        };
+        let scan = Some((7, 3, vec![link]));
+        assert_eq!(links_for(&scan, 7, 3).map(<[Link]>::len), Some(1));
+        assert_eq!(links_for(&scan, 7, 2), None, "another frame");
+        assert_eq!(links_for(&scan, 8, 3), None, "another capture");
+        assert_eq!(links_for(&None, 7, 3), None);
+    }
+
+    #[test]
+    fn the_file_editor_and_scrolled_captures_offer_no_link() {
+        assert!(card_offers_link(true, false));
+        assert!(!card_offers_link(true, true), "file editor");
+        assert!(
+            !card_offers_link(false, false),
+            "not an area of the frozen screen"
+        );
     }
 }

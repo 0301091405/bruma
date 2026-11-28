@@ -37,6 +37,8 @@ pub enum ToastAction {
     Pin(PinRequest),
     /// Open the capture again to draw on it.
     Edit,
+    /// Copy the link (or the text of a QR code) the card offers.
+    CopyLink(String, bruma_core::links::Kind),
 }
 
 pub struct Toast {
@@ -49,6 +51,10 @@ pub struct Toast {
     pin: Option<PinRequest>,
     /// A left click opens the capture again to draw on it.
     edit: bool,
+    /// The line offering a link (in the card's pixels), and the link.
+    link: Option<(bruma_core::Rect, String, bruma_core::links::Kind)>,
+    /// Where the pointer is on the card.
+    pointer: (f32, f32),
 }
 
 impl Toast {
@@ -60,6 +66,7 @@ impl Toast {
         lifetime: Duration,
         pin: Option<PinRequest>,
         edit: bool,
+        link: Option<(bruma_core::Rect, String, bruma_core::links::Kind)>,
     ) -> Result<Self, String> {
         let size = PhysicalSize::new(image.width, image.height);
         let picture = IntSize::from_wh(image.width, image.height)
@@ -93,6 +100,8 @@ impl Toast {
             deadline: Instant::now() + lifetime,
             pin,
             edit,
+            link,
+            pointer: (-1.0, -1.0),
         };
         toast.draw();
         Ok(toast)
@@ -128,6 +137,21 @@ impl Toast {
     pub fn on_event(&mut self, event: WindowEvent) -> ToastAction {
         match event {
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.link.as_ref().is_some_and(|(line, _, _)| {
+                line.contains(bruma_core::Point::new(self.pointer.0, self.pointer.1))
+            }) =>
+            {
+                if let Some((_, url, kind)) = self.link.take() {
+                    return ToastAction::CopyLink(url, kind);
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,

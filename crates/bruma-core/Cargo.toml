@@ -14,3 +14,7 @@ fontdb = "0.24"
 png = "0.18"
 gif = "0.14"
 color_quant = "1.1"
+rqrr = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+qrcode = { version = "0.15", default-features = false }

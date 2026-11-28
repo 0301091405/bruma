@@ -11,6 +11,8 @@ pub enum StripItem {
     Undo,
     Redo,
     Copy,
+    /// Reads the text in the selection onto the clipboard.
+    CopyText,
     Save,
     Pin,
 }
@@ -39,7 +41,12 @@ pub fn layout(selection: Rect, bounds: Rect, scale: f32) -> StripLayout {
         &Tool::ALL.map(StripItem::Tool),
         &[StripItem::Color],
         &[StripItem::Undo, StripItem::Redo],
-        &[StripItem::Copy, StripItem::Save, StripItem::Pin],
+        &[
+            StripItem::Copy,
+            StripItem::CopyText,
+            StripItem::Save,
+            StripItem::Pin,
+        ],
     ];
     let count: usize = groups.iter().map(|g| g.len()).sum();
     let cell_w = (CELL_W * scale).round();
@@ -105,6 +112,7 @@ impl StripItem {
             StripItem::Undo => "Undo",
             StripItem::Redo => "Redo",
             StripItem::Copy => "Copy and close",
+            StripItem::CopyText => "Copy the text and close",
             StripItem::Save => "Save and close",
             StripItem::Pin => "Pin on screen",
         }
@@ -169,10 +177,19 @@ mod tests {
     #[test]
     fn has_every_tool_and_action_once() {
         let s = layout(Rect::new(600.0, 200.0, 800.0, 400.0), SCREEN, 1.0);
-        assert_eq!(s.cells.len(), 18);
+        assert_eq!(s.cells.len(), 19);
         assert_eq!(s.separators.len(), 3);
         let first = s.cells[0].1;
         assert_eq!(s.hit(first.center()), Some(StripItem::Tool(Tool::Select)));
         assert_eq!(s.hit(Point::new(first.x - 100.0, first.y)), None);
+    }
+
+    #[test]
+    fn copy_text_sits_next_to_copy() {
+        let s = layout(Rect::new(600.0, 200.0, 800.0, 400.0), SCREEN, 1.0);
+        let items: Vec<StripItem> = s.cells.iter().map(|(item, _)| *item).collect();
+        let at = items.iter().position(|i| *i == StripItem::Copy).unwrap();
+        assert_eq!(items[at + 1], StripItem::CopyText);
+        assert_eq!(StripItem::CopyText.name(), "Copy the text and close");
     }
 }

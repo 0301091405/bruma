@@ -36,6 +36,8 @@ pub struct Config {
     /// asks), so that the hotkey and the overlay also work over games that
     /// run that way. Without the task Bruma runs as it is.
     pub games: bool,
+    /// Find links and QR codes on the frozen screen, to copy them.
+    pub links: bool,
     /// Keep recording for rewind while a game or a film fills the screen.
     /// Off, so that a game never pays for a feature it is not using.
     pub rewind_fullscreen: bool,
@@ -67,6 +69,7 @@ impl Default for Config {
             clip: 10.0,
             quick: true,
             games: true,
+            links: true,
             rewind_fullscreen: false,
             fast_capture: true,
             cursor: false,
@@ -141,6 +144,11 @@ impl Config {
                 "quick",
                 self.quick.to_string(),
                 "copy as soon as an area is chosen; Shift keeps it open to draw",
+            ),
+            (
+                "links",
+                self.links.to_string(),
+                "find links and QR codes in captures",
             ),
             (
                 "games",

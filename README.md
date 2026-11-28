@@ -49,6 +49,9 @@ The files aren't signed, so SmartScreen may warn you. Choose "More info", then
   as you let go.
 - **Snap.** Whatever is under the cursor gets an outline. `Tab` steps out to
   the larger area around it, like the page of a browser, then the window.
+- **Links.** Web addresses and QR codes on the screen get a light underline.
+  Point at one for a "Copy link" button; the card after a capture offers it
+  too. Nothing leaves the computer.
 - **Rewind.** Turn the mouse wheel to go back through the last few seconds.
   `W` selects what changed.
 - **GIF.** `K` turns the last ten seconds into a GIF at 30 frames a second.
@@ -60,8 +63,9 @@ The files aren't signed, so SmartScreen may warn you. Choose "More info", then
   afterwards. If Windows won't let anything show over the game, the whole
   screen is copied and a shutter sound says so.
 - **Private text.** `M` blurs e-mail addresses, card numbers, passwords and
-  the like. `X` copies the text. It uses the text recognition built into
-  Windows and can miss things, so check before you send.
+  the like. `X`, or the button next to Copy, copies the text. It uses the text
+  recognition built into Windows and can miss things, so check before you
+  send.
 
 ![Pointing at a button outlines the button](docs/snap.png)
 

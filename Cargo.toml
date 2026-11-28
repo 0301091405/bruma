@@ -3,14 +3,14 @@ resolver = "3"
 members = ["crates/bruma-core", "crates/bruma"]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/0301091405/bruma"
 
 [workspace.dependencies]
-bruma-core = { path = "crates/bruma-core", version = "0.7.3" }
+bruma-core = { path = "crates/bruma-core", version = "0.8.0" }
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 [profile.dev]

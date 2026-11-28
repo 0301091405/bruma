@@ -29,6 +29,8 @@ pub struct Values {
     /// Copy the moment an area is chosen.
     pub quick: bool,
     pub snap: bool,
+    /// Find links and QR codes on the frozen screen.
+    pub links: bool,
     pub cursor: bool,
     /// Seconds; 0 is off.
     pub rewind: f32,
@@ -52,6 +54,7 @@ pub enum Item {
     Hotkey,
     Quick,
     Snap,
+    Links,
     Cursor,
     Rewind,
     Clip,
@@ -96,6 +99,7 @@ const SECTIONS: &[(&str, &[(Item, &str)])] = &[
             (Item::Hotkey, "Hotkey"),
             (Item::Quick, "Copy as soon as an area is chosen"),
             (Item::Snap, "Snap to boxes and edges"),
+            (Item::Links, "Find links and QR codes"),
             (Item::Cursor, "Include the mouse cursor"),
             (Item::Rewind, "Rewind"),
             (Item::Clip, "GIF length"),
@@ -431,6 +435,7 @@ impl Form {
             Item::Preview => v.preview = step(PREVIEW_STEPS, v.preview, up),
             Item::History => v.history = step(HISTORY_STEPS, v.history as f32, up) as usize,
             Item::Snap => v.snap = up,
+            Item::Links => v.links = up,
             Item::Cursor => v.cursor = up,
             Item::Autosave => v.autosave = up,
             Item::Autostart => v.autostart = up,
@@ -453,6 +458,7 @@ impl Form {
                 let on = match item {
                     Item::Quick => self.values.quick,
                     Item::Snap => self.values.snap,
+                    Item::Links => self.values.links,
                     Item::Cursor => self.values.cursor,
                     Item::Autosave => self.values.autosave,
                     Item::Autostart => self.values.autostart,
@@ -625,6 +631,7 @@ impl Form {
                     let on = match row.item {
                         Item::Quick => self.values.quick,
                         Item::Snap => self.values.snap,
+                        Item::Links => self.values.links,
                         Item::Cursor => self.values.cursor,
                         Item::Autosave => self.values.autosave,
                         Item::Autostart => self.values.autostart,
@@ -875,6 +882,7 @@ mod tests {
             hotkey: "PrintScreen".into(),
             quick: true,
             snap: true,
+            links: true,
             cursor: false,
             rewind: 4.0,
             clip: 10.0,
@@ -929,6 +937,27 @@ mod tests {
         assert!(!f.values.snap);
         click(&mut f, Item::Snap, Part::Body);
         assert!(f.values.snap);
+    }
+
+    #[test]
+    fn the_links_switch_is_in_capture_and_toggles() {
+        let mut f = form();
+        let capture = SECTIONS
+            .iter()
+            .find(|(name, _)| *name == "CAPTURE")
+            .unwrap()
+            .1;
+        assert!(
+            capture
+                .iter()
+                .any(|(item, label)| *item == Item::Links && *label == "Find links and QR codes")
+        );
+        assert!(f.values.links);
+        assert_eq!(
+            click(&mut f, Item::Links, Part::Body),
+            [Effect::Changed, Effect::Redraw]
+        );
+        assert!(!f.values.links);
     }
 
     #[test]
@@ -1026,6 +1055,8 @@ mod tests {
             [Effect::Changed, Effect::Redraw]
         );
         assert!(!f.values.snap);
+        f.handle(Input::Key(Key::Down));
+        assert_eq!(f.focus, Some(Item::Links));
         f.handle(Input::Key(Key::Down));
         f.handle(Input::Key(Key::Down));
         assert_eq!(f.focus, Some(Item::Rewind));

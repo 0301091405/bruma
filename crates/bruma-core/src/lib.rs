@@ -15,6 +15,7 @@ pub mod geom;
 pub mod glyph;
 pub mod image;
 pub mod intro;
+pub mod links;
 pub mod logo;
 pub mod menu;
 pub mod par;

@@ -268,6 +268,7 @@ impl Renderer {
         if let (Some(view), Some(bar)) = (s.clip(), s.clip_bar()) {
             clip_bar(pixmap, glass, s.fonts(), view, &bar, scale);
         }
+        links(pixmap, glass, s, scale);
         let monitor = s.monitor_of(s.pointer());
         if let Some(text) = s.notice() {
             let rect = pill_rect(s.fonts(), text, monitor, scale);
@@ -411,6 +412,7 @@ fn strip_key(item: StripItem) -> String {
         StripItem::Undo => "Ctrl+Z".into(),
         StripItem::Redo => "Ctrl+Y".into(),
         StripItem::Copy => "Enter".into(),
+        StripItem::CopyText => "X".into(),
         StripItem::Save => "Ctrl+S".into(),
         StripItem::Pin => "P".into(),
     }
@@ -479,6 +481,21 @@ pub fn preview_card(
     monitor: Rect,
     scale: f32,
 ) -> (Image, Rect) {
+    let (card, rect, _) = preview_card_with_link(screen, shot, fonts, text, monitor, scale, None);
+    (card, rect)
+}
+
+/// [`preview_card`] with one more line under the caption when there is a
+/// link to offer; the third value is that line, in the card's coordinates.
+pub fn preview_card_with_link(
+    screen: &Image,
+    shot: &Image,
+    fonts: &Fonts,
+    text: &str,
+    monitor: Rect,
+    scale: f32,
+    link: Option<&str>,
+) -> (Image, Rect, Option<Rect>) {
     let pad = (10.0 * scale).round();
     let caption = (30.0 * scale).round();
     let px = (11.0 * scale).round();
@@ -492,7 +509,11 @@ pub fn preview_card(
         .max(dot + (8.0 * scale).round() + text_w)
         .max(150.0 * scale)
         .round();
-    let (w, h) = (inner + 2.0 * pad, pad + th + caption);
+    let row = (26.0 * scale).round();
+    let link_w = link.map_or(0.0, |l| fonts.measure(Face::Mono, l, px).0);
+    let inner = inner.max(link_w).round();
+    let extra = if link.is_some() { row } else { 0.0 };
+    let (w, h) = (inner + 2.0 * pad, pad + th + caption + extra);
     let margin = (24.0 * scale).round();
     let rect = Rect::new(
         monitor.right() - margin - w,
@@ -504,6 +525,7 @@ pub fn preview_card(
     .intersect(&screen.bounds());
     let crop = screen.crop(rect);
     let (cw, ch) = (crop.width, crop.height);
+    let line_rect = link.map(|_| Rect::new(0.0, pad + th + caption, cw as f32, row));
     let mut small = blur::downscale(&crop.rgba, cw as usize, ch as usize, 4);
     blur::blur(&mut small, (4.0 * scale).round().max(2.0) as usize, 3);
     let glass = IntSize::from_wh(small.w as u32, small.h as u32)
@@ -511,7 +533,7 @@ pub fn preview_card(
     let pixmap =
         IntSize::from_wh(cw, ch).and_then(|size| Pixmap::from_vec(crop.rgba.clone(), size));
     let (Some(glass), Some(mut pixmap)) = (glass, pixmap) else {
-        return (crop, rect);
+        return (crop, rect, line_rect);
     };
     let card = Rect::new(0.0, 0.0, cw as f32, ch as f32);
     glass_panel(&mut pixmap, &glass, card, 12.0 * scale, scale);
@@ -544,7 +566,13 @@ pub fn preview_card(
         (cy - text_h / 2.0).round(),
     );
     fonts.draw(&mut pixmap, Face::Mono, text, px, at, PAPER);
-    (Image::new(cw, ch, pixmap.take()), rect)
+    // The link, in the accent colour, on a line of its own.
+    if let (Some(line), Some(label)) = (line_rect, link) {
+        let (_, lh) = fonts.measure(Face::Mono, label, px);
+        let at = Point::new(pad, (line.y + (line.h - lh) / 2.0 - (4.0 * scale)).round());
+        fonts.draw(&mut pixmap, Face::Mono, label, px, at, ACCENT);
+    }
+    (Image::new(cw, ch, pixmap.take()), rect, line_rect)
 }
 
 /// Copies a finished frame into a window's buffer, which wants one
@@ -559,6 +587,43 @@ pub fn present(pixmap: &Pixmap, frame: &mut [u32]) {
             *out = ((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF);
         }
     });
+}
+
+/// Links on the screen: a light underline under written addresses, a thin
+/// outline round QR codes, and the button of the one the pointer is over.
+fn links(pixmap: &mut Pixmap, glass: &Pixmap, s: &Session, scale: f32) {
+    let line = (1.5 * scale).max(1.0);
+    for link in s.links() {
+        let r = link.rect;
+        if link.qr {
+            for edge in [
+                Rect::new(r.x, r.y, r.w, line),
+                Rect::new(r.x, r.bottom() - line, r.w, line),
+                Rect::new(r.x, r.y, line, r.h),
+                Rect::new(r.right() - line, r.y, line, r.h),
+            ] {
+                fill_rect(pixmap, edge, ACCENT, 0.55);
+            }
+        } else {
+            fill_rect(
+                pixmap,
+                Rect::new(r.x, r.bottom() + line, r.w, line),
+                ACCENT,
+                0.55,
+            );
+        }
+    }
+    if let Some((button, link)) = s.link_button() {
+        glass_panel(pixmap, glass, button, button.h / 2.0, scale);
+        let label = crate::session::link_label(&link.kind);
+        let px = (12.0 * scale).round();
+        let (tw, th) = s.fonts().measure(Face::Mono, label, px);
+        let at = Point::new(
+            (button.x + (button.w - tw) / 2.0).round(),
+            (button.y + (button.h - th) / 2.0).round(),
+        );
+        s.fonts().draw(pixmap, Face::Mono, label, px, at, PAPER);
+    }
 }
 
 /// Where a message pill sits: bottom centre of `monitor`.
@@ -1153,6 +1218,7 @@ fn draw_strip(pixmap: &mut Pixmap, glass: &Pixmap, s: &Session, layout: &StripLa
             StripItem::Undo => "^Z".to_string(),
             StripItem::Redo => "^Y".to_string(),
             StripItem::Copy => String::new(),
+            StripItem::CopyText => "X".to_string(),
             StripItem::Save => "^S".to_string(),
             StripItem::Pin => "P".to_string(),
         };
@@ -1227,6 +1293,70 @@ mod tests {
         let mut pixmap = Pixmap::new(SIZE.0, SIZE.1).unwrap();
         Renderer::new().render(s, &mut pixmap);
         Image::new(SIZE.0, SIZE.1, pixmap.take())
+    }
+
+    #[test]
+    fn a_card_with_a_link_is_taller_and_says_so() {
+        let screen = Image::filled(1280, 800, [90, 90, 90, 255]);
+        let shot = Image::filled(400, 300, [200, 200, 200, 255]);
+        let monitor = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let fonts = Fonts::empty();
+        let (plain, _, none) =
+            preview_card_with_link(&screen, &shot, &fonts, "Copied", monitor, 1.0, None);
+        let (card, _, line) = preview_card_with_link(
+            &screen,
+            &shot,
+            &fonts,
+            "Copied",
+            monitor,
+            1.0,
+            Some("Copy link  github.com/0301091405/bruma"),
+        );
+        assert!(
+            card.height > plain.height,
+            "{} vs {}",
+            card.height,
+            plain.height
+        );
+        assert_eq!(none, None);
+        let line = line.expect("a link line");
+        assert!(
+            line.bottom() <= card.height as f32 && line.right() <= card.width as f32,
+            "{line:?}"
+        );
+        assert!(line.y >= plain.height as f32 - 1.0, "{line:?}");
+    }
+
+    #[test]
+    fn links_get_an_underline_and_the_hovered_one_a_button() {
+        let link = crate::links::Link {
+            url: "https://example.com".into(),
+            rect: Rect::new(320.0, 300.0, 150.0, 16.0),
+            kind: crate::links::Kind::Web,
+            qr: false,
+        };
+        let mut s = session(1.0);
+        let before = render(&s);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link],
+        });
+        let underlined = render(&s);
+        let at = |img: &Image, x: u32, y: u32| {
+            let i = ((y * img.width + x) * 4) as usize;
+            img.rgba[i..i + 4].to_vec()
+        };
+        assert_ne!(
+            at(&before, 400, 317),
+            at(&underlined, 400, 317),
+            "an underline"
+        );
+        s.handle(Input::PointerMove(Point::new(400.0, 308.0)));
+        let (button, _) = s.link_button().expect("a button");
+        let hovered = render(&s);
+        let (bx, by) = ((button.x + 3.0) as u32, (button.y + button.h / 2.0) as u32);
+        assert_ne!(at(&underlined, bx, by), at(&hovered, bx, by), "a button");
     }
 
     fn select(s: &mut Session) {

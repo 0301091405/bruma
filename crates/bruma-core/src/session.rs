@@ -11,6 +11,7 @@ use crate::doc::{Annotation, Doc, Shape};
 use crate::export::flatten_scaled;
 use crate::geom::{Point, Rect, constrain_45, constrain_square};
 use crate::image::Image;
+use crate::links::{Kind, Link};
 use crate::redact::{self, Word};
 use crate::snap;
 use crate::strip::{self, StripItem, StripLayout};
@@ -116,6 +117,11 @@ pub enum Input {
     /// Words recognised in the image sent with [`Effect::FindWords`], in
     /// screen coordinates.
     Words(Vec<Word>),
+    /// Links and QR codes found in frame `frame` (see [`Session::links`]).
+    Links {
+        frame: usize,
+        links: Vec<Link>,
+    },
     /// A double click: edits the text under it, or copies the selection.
     /// Answers with nothing when it means nothing here.
     DoubleClick(Point),
@@ -355,6 +361,14 @@ enum Output {
 /// A drag shorter than this many pixels is a click.
 const CLICK_SLOP: f32 = 4.0;
 
+/// What the button beside a link says.
+pub fn link_label(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Web => "Copy link",
+        Kind::Text => "Copy text",
+    }
+}
+
 pub struct Session {
     frames: Vec<Frame>,
     frame: usize,
@@ -375,6 +389,13 @@ pub struct Session {
     mods: Mods,
     /// A short message for the person, shown until their next action.
     notice: Option<String>,
+    /// Links found on the screen, and the frame they were found in.
+    links: Vec<Link>,
+    links_frame: usize,
+    /// A press went to a link's button: its release is the button's too.
+    link_pressed: bool,
+    /// The link button last drawn, to redraw when it comes or goes.
+    link_shown: Option<Rect>,
     snap: bool,
     hover: Hover,
     /// The list of keys is showing.
@@ -449,6 +470,10 @@ impl Session {
             pointer: Point::new(bounds.w / 2.0, bounds.h / 2.0),
             mods: Mods::default(),
             notice: None,
+            links: Vec::new(),
+            links_frame: 0,
+            link_pressed: false,
+            link_shown: None,
             snap: options.snap,
             hover: Hover::Unknown,
             help: false,
@@ -661,6 +686,103 @@ impl Session {
     }
 
     /// A short message for the person, shown until their next action.
+    /// Links to underline now: none while another frame than the one they
+    /// were found in is shown; with a selection, only those inside it.
+    pub fn links(&self) -> Vec<&Link> {
+        if self.frame_index() != self.links_frame || self.clip.is_some() {
+            return Vec::new();
+        }
+        self.links
+            .iter()
+            .filter(|l| {
+                let middle = Point::new(l.rect.x + l.rect.w / 2.0, l.rect.y + l.rect.h / 2.0);
+                self.selection.is_none_or(|sel| sel.contains(middle))
+            })
+            .collect()
+    }
+
+    /// Where the button for `link` goes: just under it, or above it when
+    /// there is no room below, and always on the link's monitor.
+    fn link_button_for(&self, link: &Link) -> Rect {
+        let scale = self.scale;
+        let px = (12.0 * scale).round();
+        let (tw, _) = self.fonts.measure(Face::Mono, link_label(&link.kind), px);
+        let pad = (12.0 * scale).round();
+        let (w, h) = ((tw + 2.0 * pad).round(), (28.0 * scale).round());
+        let gap = (6.0 * scale).round();
+        let r = link.rect;
+        let monitor = self.monitor_of(Point::new(r.x + r.w / 2.0, r.y + r.h / 2.0));
+        let x = r.x.min(monitor.right() - w).max(monitor.x);
+        let below = r.bottom() + gap;
+        let y = if below + h <= monitor.bottom() {
+            below
+        } else {
+            (r.y - gap - h).max(monitor.y)
+        };
+        Rect::new(x.round(), y.round(), w, h)
+    }
+
+    /// The "Copy link" button for the link the pointer is over (or is on
+    /// the button of): where the button is, and its link.
+    pub fn link_button(&self) -> Option<(Rect, &Link)> {
+        let p = self.pointer;
+        let slack = 4.0 * self.scale;
+        let links = self.links();
+        // The link the pointer is on comes first: another link's button may
+        // lie over its text.
+        let on = links.iter().find(|link| {
+            let r = link.rect;
+            Rect::new(
+                r.x - slack,
+                r.y - slack,
+                r.w + 2.0 * slack,
+                r.h + 2.0 * slack,
+            )
+            .contains(p)
+        });
+        if let Some(link) = on {
+            return Some((self.link_button_for(link), link));
+        }
+        // Otherwise only a button already showing keeps going, while the
+        // pointer is anywhere between its link and it (the gap, a slanting
+        // path to its far end): nothing pops up where no link is.
+        let shown = self.link_shown?;
+        links.into_iter().find_map(|link| {
+            let button = self.link_button_for(link);
+            let r = link.rect;
+            let x = r.x.min(button.x) - slack;
+            let y = r.y.min(button.y) - slack;
+            let way = Rect::new(
+                x,
+                y,
+                r.right().max(button.right()) + slack - x,
+                r.bottom().max(button.bottom()) + slack - y,
+            );
+            (button == shown && way.contains(p)).then_some((button, link))
+        })
+    }
+
+    /// A press on a link's button copies the link; `true` when it did.
+    fn press_link_button(&mut self, p: Point, fx: &mut Vec<Effect>) -> bool {
+        let copy = self
+            .link_button()
+            .filter(|(button, _)| button.contains(p))
+            .map(|(_, link)| (link.url.clone(), link.kind));
+        let Some((url, kind)) = copy else {
+            return false;
+        };
+        fx.push(Effect::CopyText(url));
+        self.notice = Some(
+            match kind {
+                Kind::Web => "Link copied",
+                Kind::Text => "Text copied",
+            }
+            .into(),
+        );
+        self.link_pressed = true;
+        true
+    }
+
     pub fn say(&mut self, text: &str) {
         self.notice = Some(text.to_string());
     }
@@ -846,7 +968,14 @@ impl Session {
                     self.pointer_move(self.pointer, &mut fx);
                 }
             }
-            Input::PointerMove(p) => self.pointer_move(p, &mut fx),
+            Input::PointerMove(p) => {
+                self.pointer_move(p, &mut fx);
+                let shown = self.link_button().map(|(button, _)| button);
+                if shown != self.link_shown {
+                    self.link_shown = shown;
+                    fx.push(Effect::Redraw);
+                }
+            }
             Input::PointerDown(p) => self.pointer_down(p, &mut fx),
             Input::PointerUp(p) => self.pointer_up(p, &mut fx),
             Input::SecondaryDown => self.escape(&mut fx),
@@ -895,6 +1024,13 @@ impl Session {
                 {
                     self.drag = Drag::None;
                     self.finish(Output::Copy, &mut fx);
+                }
+            }
+            Input::Links { frame, links } => {
+                if frame == self.frame_index() {
+                    self.links = links;
+                    self.links_frame = frame;
+                    fx.push(Effect::Redraw);
                 }
             }
             Input::Words(words) => {
@@ -1050,8 +1186,11 @@ impl Session {
         if self.clip_press(p) {
             return;
         }
-
         let Some(sel) = self.selection else {
+            // The button beside a link copies it; the press goes no further.
+            if self.press_link_button(p, fx) {
+                return;
+            }
             self.drag = Drag::Select {
                 anchor: p,
                 active: false,
@@ -1066,6 +1205,10 @@ impl Session {
             if layout.rect.contains(p) {
                 return;
             }
+        }
+        // After the tool strip: a button that falls on it never hides a tool.
+        if self.press_link_button(p, fx) {
+            return;
         }
         match self.tool {
             // While a GIF is being made the area stays where it is: only the
@@ -1267,6 +1410,9 @@ impl Session {
     }
 
     fn pointer_up(&mut self, p: Point, fx: &mut Vec<Effect>) {
+        if std::mem::take(&mut self.link_pressed) {
+            return;
+        }
         if let Some(grab) = self.clip_grab.take() {
             if let Some(view) = &mut self.clip {
                 if grab != ClipGrab::At {
@@ -1457,20 +1603,16 @@ impl Session {
                         }
                     }
                 }
-                'x' | 'm' => {
-                    let bounds = self.screen().bounds();
-                    let Some(area) = self
-                        .selection
-                        .map(|s| s.round().intersect(&bounds))
-                        .filter(|s| !s.is_empty())
-                    else {
+                'x' => {
+                    self.copy_text(fx);
+                    return;
+                }
+                'm' => {
+                    let Some(area) = self.selected_screen() else {
                         return;
                     };
                     let image = self.screen().crop(area);
-                    if c == 'x' {
-                        fx.push(Effect::ExtractText(image));
-                        fx.push(Effect::Close);
-                    } else {
+                    {
                         self.notice = Some("reading".into());
                         fx.push(Effect::Redraw);
                         fx.push(Effect::FindWords(image, Point::new(area.x, area.y)));
@@ -1646,8 +1788,25 @@ impl Session {
             StripItem::Undo => self.undo(),
             StripItem::Redo => self.redo(),
             StripItem::Copy => self.finish(Output::Copy, fx),
+            StripItem::CopyText => self.copy_text(fx),
             StripItem::Save => self.finish(Output::Save, fx),
             StripItem::Pin => self.finish(Output::Pin, fx),
+        }
+    }
+
+    /// The selection on the screen, in whole pixels, when there is one.
+    fn selected_screen(&self) -> Option<Rect> {
+        let bounds = self.screen().bounds();
+        self.selection
+            .map(|s| s.round().intersect(&bounds))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Reads the text in the selection onto the clipboard, and closes.
+    fn copy_text(&mut self, fx: &mut Vec<Effect>) {
+        if let Some(area) = self.selected_screen() {
+            fx.push(Effect::ExtractText(self.screen().crop(area)));
+            fx.push(Effect::Close);
         }
     }
 
@@ -2236,6 +2395,24 @@ mod tests {
         drag(&mut s, cell.center(), cell.center());
         assert_eq!(s.tool(), Tool::Rect);
         assert!(s.doc().items().is_empty());
+    }
+
+    #[test]
+    fn the_copy_text_button_copies_the_text_of_the_selection() {
+        let mut s = selected();
+        let layout = s.strip().unwrap();
+        let (_, cell) = layout
+            .cells
+            .iter()
+            .find(|(i, _)| *i == StripItem::CopyText)
+            .unwrap();
+        let fx = drag(&mut s, cell.center(), cell.center());
+        let fx: Vec<&Effect> = fx.iter().filter(|e| **e != Effect::Redraw).collect();
+        assert!(
+            matches!(&fx[..], [Effect::ExtractText(img), Effect::Close] if (img.width, img.height) == (400, 300)),
+            "{:?}",
+            fx.len()
+        );
     }
 
     #[test]
@@ -2878,6 +3055,205 @@ mod tests {
         drag(&mut s, pt(300.0, 300.0), pt(500.0, 500.0));
         key(&mut s, 'f');
         assert_eq!(s.selection(), Some(Rect::new(200.0, 150.0, 400.0, 300.0)));
+    }
+
+    fn link(url: &str, x: f32, y: f32, w: f32, h: f32) -> Link {
+        Link {
+            url: url.into(),
+            rect: Rect::new(x, y, w, h),
+            kind: Kind::Web,
+            qr: false,
+        }
+    }
+
+    fn plain(w: u32, h: u32) -> Session {
+        let screen = Image::filled(w, h, [255, 255, 255, 255]);
+        Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            Vec::new(),
+            vec![Rect::new(0.0, 0.0, w as f32, h as f32)],
+            Options::default(),
+        )
+    }
+
+    #[test]
+    fn links_for_another_frame_are_ignored() {
+        let mut s = plain(800, 600);
+        s.handle(Input::Links {
+            frame: s.frame_index() + 1,
+            links: vec![link("https://example.com", 100.0, 100.0, 200.0, 20.0)],
+        });
+        assert!(s.links().is_empty());
+    }
+
+    #[test]
+    fn pointing_at_a_link_offers_the_button_and_a_click_on_it_copies() {
+        let mut s = plain(800, 600);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://example.com", 100.0, 100.0, 200.0, 20.0)],
+        });
+        assert_eq!(s.links().len(), 1);
+        s.handle(Input::PointerMove(pt(150.0, 110.0)));
+        let (button, offered) = s.link_button().expect("a button");
+        assert_eq!(offered.url, "https://example.com");
+        assert!(button.y >= 120.0, "{button:?}");
+        let at = pt(button.x + button.w / 2.0, button.y + button.h / 2.0);
+        s.handle(Input::PointerMove(at));
+        let mut fx = s.handle(Input::PointerDown(at));
+        fx.extend(s.handle(Input::PointerUp(at)));
+        assert!(
+            fx.contains(&Effect::CopyText("https://example.com".into())),
+            "{fx:?}"
+        );
+        assert_eq!(s.notice(), Some("Link copied"));
+        assert_eq!(s.selection(), None);
+    }
+
+    #[test]
+    fn a_click_on_the_link_text_still_selects() {
+        let mut screen = Image::filled(800, 600, [255, 255, 255, 255]);
+        screen.fill_rect(Rect::new(80.0, 90.0, 260.0, 40.0), [90, 160, 230, 255]);
+        let mut s = Session::new(
+            vec![Frame::now(screen)],
+            Rc::new(Fonts::empty()),
+            Vec::new(),
+            vec![Rect::new(0.0, 0.0, 800.0, 600.0)],
+            Options::default(),
+        );
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://example.com", 100.0, 100.0, 200.0, 20.0)],
+        });
+        s.handle(Input::PointerMove(pt(150.0, 110.0)));
+        let fx = drag(&mut s, pt(150.0, 110.0), pt(150.0, 110.0));
+        assert!(s.selection().is_some());
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::CopyText(_))),
+            "{fx:?}"
+        );
+    }
+
+    #[test]
+    fn the_button_of_the_link_pointed_at_wins() {
+        // Two addresses on lines next to each other: the first one's button
+        // would lie over the second one's text.
+        let mut s = plain(800, 600);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![
+                link("https://first.com", 100.0, 100.0, 200.0, 16.0),
+                link("https://second.com", 100.0, 124.0, 200.0, 16.0),
+            ],
+        });
+        s.handle(Input::PointerMove(pt(150.0, 132.0)));
+        let (_, offered) = s.link_button().expect("a button");
+        assert_eq!(offered.url, "https://second.com");
+    }
+
+    #[test]
+    fn the_button_does_not_come_up_from_below() {
+        // Coming from below into the place a button would be, without
+        // pointing at the link first: no button, and a press is a press.
+        let mut s = plain(800, 600);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://example.com", 100.0, 100.0, 200.0, 16.0)],
+        });
+        s.handle(Input::PointerMove(pt(110.0, 300.0)));
+        s.handle(Input::PointerMove(pt(110.0, 132.0)));
+        assert!(s.link_button().is_none());
+        let fx = drag(&mut s, pt(110.0, 132.0), pt(300.0, 250.0));
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::CopyText(_))),
+            "{fx:?}"
+        );
+        assert!(s.selection().is_some());
+    }
+
+    #[test]
+    fn the_button_stays_while_the_pointer_goes_from_the_link_to_it() {
+        // Straight down, through the gap between the link and its button.
+        let mut s = plain(800, 600);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://example.com", 100.0, 100.0, 200.0, 16.0)],
+        });
+        s.handle(Input::PointerMove(pt(150.0, 108.0)));
+        let (button, _) = s.link_button().expect("a button on the link");
+        let mut y = 108.0;
+        while y < button.y + button.h / 2.0 {
+            y += 1.0;
+            s.handle(Input::PointerMove(pt(150.0, y)));
+            assert!(s.link_button().is_some(), "lost at y = {y}");
+        }
+        let fx = s.handle(Input::PointerDown(pt(150.0, y)));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::CopyText(u) if u == "https://example.com")),
+            "{fx:?}"
+        );
+
+        // A link shorter than its button, and a slanting path to the far
+        // end of the button.
+        let mut s = plain(800, 600);
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://x.io", 100.0, 100.0, 30.0, 16.0)],
+        });
+        s.handle(Input::PointerMove(pt(110.0, 108.0)));
+        let (button, _) = s.link_button().expect("a button on the link");
+        assert!(button.right() > 140.0, "{button:?}");
+        let end = pt(button.right() - 4.0, button.y + button.h / 2.0);
+        for i in 1..=20 {
+            let t = i as f32 / 20.0;
+            let p = pt(110.0 + (end.x - 110.0) * t, 108.0 + (end.y - 108.0) * t);
+            s.handle(Input::PointerMove(p));
+            assert!(s.link_button().is_some(), "lost at {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_button_stays_on_the_monitor() {
+        let mut s = plain(1920, 1080);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![link("https://example.com", 1880.0, 1060.0, 40.0, 16.0)],
+        });
+        s.handle(Input::PointerMove(pt(1900.0, 1068.0)));
+        let (button, _) = s.link_button().expect("a button");
+        let monitor = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        assert!(
+            button.x >= 0.0
+                && button.y >= 0.0
+                && button.right() <= monitor.right()
+                && button.bottom() <= monitor.bottom(),
+            "{button:?}"
+        );
+    }
+
+    #[test]
+    fn with_a_selection_only_links_inside_are_shown() {
+        let mut s = plain(800, 600);
+        let frame = s.frame_index();
+        s.handle(Input::Links {
+            frame,
+            links: vec![
+                link("https://in.com", 100.0, 100.0, 100.0, 20.0),
+                link("https://out.com", 600.0, 500.0, 100.0, 20.0),
+            ],
+        });
+        s.select(Rect::new(50.0, 50.0, 300.0, 200.0));
+        let shown = s.links();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].url, "https://in.com");
     }
 
     #[test]

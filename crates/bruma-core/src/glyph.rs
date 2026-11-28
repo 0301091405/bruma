@@ -167,6 +167,18 @@ fn parts(item: StripItem) -> Vec<(Option<Path>, Ink)> {
             }),
             Stroke,
         )],
+        // A T in the corners of a frame: the text read from a picture.
+        StripItem::CopyText => vec![(
+            path(|pb| {
+                polyline(pb, &[(2.5, 5.5), (2.5, 2.5), (5.5, 2.5)]);
+                polyline(pb, &[(10.5, 2.5), (13.5, 2.5), (13.5, 5.5)]);
+                polyline(pb, &[(13.5, 10.5), (13.5, 13.5), (10.5, 13.5)]);
+                polyline(pb, &[(5.5, 13.5), (2.5, 13.5), (2.5, 10.5)]);
+                polyline(pb, &[(5.5, 5.5), (10.5, 5.5)]);
+                polyline(pb, &[(8.0, 5.5), (8.0, 10.5)]);
+            }),
+            Stroke,
+        )],
         StripItem::Save => vec![(
             path(|pb| {
                 polyline(pb, &[(8.0, 2.5), (8.0, 10.0)]);

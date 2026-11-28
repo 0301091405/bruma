@@ -953,7 +953,10 @@ pub fn ocr(image: &Image) -> Result<Vec<Word>, String> {
         ));
     }
     // Screen text is small; the engine reads it far better at twice the size.
-    let factor = if image.width.max(image.height) * 2 <= limit {
+    // Small text reads better doubled; a picture already this large is
+    // read as it is.
+    let small = (image.width as u64) * (image.height as u64) <= 2_600_000;
+    let factor = if small && image.width.max(image.height) * 2 <= limit {
         2
     } else {
         1

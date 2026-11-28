@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-11-28
+
+- Web addresses and QR codes on the frozen screen get a light underline.
+  Pointing at one shows a "Copy link" button, and the card after a capture
+  offers the link in the chosen area. Text recognition and QR reading run on
+  the computer, after the overlay is up; taking the screenshot never waits.
+- "Find links and QR codes" in Settings (`links` in the settings file) turns
+  this off.
+- The strip has a "Copy text" button next to Copy: it reads the text in the
+  selection onto the clipboard (the same as `X`).
+
 ## 0.7.3 - 2026-11-27
 
 - On Windows 11, where `PrintScreen` opens the Snipping Tool by default, it

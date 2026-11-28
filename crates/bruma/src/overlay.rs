@@ -65,6 +65,7 @@ pub struct Snapshot {
 const CLIP_FRAME: Duration = Duration::from_millis(33);
 
 /// The screen an overlay was showing, for messages that outlive it.
+#[derive(Clone)]
 pub struct Scene {
     pub screen: std::sync::Arc<bruma_core::Image>,
     /// Desktop coordinates of the screen image's top-left pixel.
@@ -74,6 +75,8 @@ pub struct Scene {
     pub scale: f32,
     /// What was selected, in image coordinates.
     pub selection: Option<Rect>,
+    /// Which frame of the recording the screen is.
+    pub frame: usize,
 }
 
 /// The overlay's window and its buffers, without a capture in them. The
@@ -585,8 +588,19 @@ impl Overlay {
     }
 
     /// What a message shown after this overlay closes needs to know.
+    /// The picture to look for links in (the frame shown when the overlay
+    /// opened) and which frame it is.
+    pub fn scan_input(&self) -> (std::sync::Arc<Image>, usize, Vec<Rect>) {
+        (
+            self.session.current(),
+            self.session.frame_index(),
+            self.session.monitors().to_vec(),
+        )
+    }
+
     pub fn context(&self) -> Scene {
         Scene {
+            frame: self.session.frame_index(),
             screen: self.session.present(),
             origin: self.origin,
             monitor: self.session.monitor_of(self.session.pointer()),
